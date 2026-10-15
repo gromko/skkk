@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Start Teacher
+Name[uk]=Запустити програму вчителя
+Comment=Запустити teacher.py без консолі (nohup, журнал teacher.log)
+Exec=sh -c "d=\${1#file://}; cd \"\$(dirname \"\$d\")\" && nohup python3 teacher.py > teacher.log 2>&1 &" sh %k
+Icon=computer
+Terminal=false
+StartupNotify=false
+Categories=Utility;

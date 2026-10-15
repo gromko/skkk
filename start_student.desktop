@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Start Student
+Name[uk]=Запустити агента учня
+Comment=Запустити student_agent.py у фоновому режимі (nohup, журнал student_a.log)
+Exec=sh -c "d=\${1#file://}; cd \"\$(dirname \"\$d\")\" && nohup python3 student_agent.py > student_a.log 2>&1 &" sh %k
+Icon=utilities-terminal
+Terminal=false
+StartupNotify=false
+Categories=Utility;

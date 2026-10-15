@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Stop Student
+Name[uk]=Зупинити агента учня
+Comment=Зупинити student_agent.py
+Exec=pkill -f student_agent.py
+Icon=process-stop
+Terminal=false
+StartupNotify=false
+Categories=Utility;
