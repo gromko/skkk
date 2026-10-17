@@ -60,19 +60,25 @@ jobs:
           if-no-files-found: error
 
   # --------------------------------------------------------------------------
-  # Linux: використовуємо системний Python + python3-tk (tkinter у venv)
+  # Linux: збираємо в контейнері ubuntu:22.04 (glibc 2.35), а не на раннері
+  # ubuntu-latest (24.04, glibc 2.39) — інакше libpython вимагатиме новішої
+  # glibc, ніж на цільових машинах (Debian 12 = glibc 2.36 тощо).
+  # Використовуємо системний Python 3.10 + python3-tk (весь код — 3.10+).
   # --------------------------------------------------------------------------
   build-linux:
-    name: Linux
+    name: Linux (glibc 2.35, сумісний із Debian 12)
     runs-on: ubuntu-latest
+    container:
+      image: ubuntu:22.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Системні залежності (tkinter)
+      - name: Системні залежності (git для checkout, tkinter, zip)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y python3-tk python3-venv
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git python3 python3-venv python3-tk zip ca-certificates binutils
+
+      - uses: actions/checkout@v4
 
       - name: Збірка
         run: |
@@ -89,6 +95,12 @@ jobs:
           test -x dist/netguard && test -d dist/shared_libs
           test -x dist/student/student_agent && test -d dist/student/shared_libs
           echo "ОК: shared_libs на місці"
+
+      - name: Звіт про потрібну версію glibc (для діагностики)
+        run: |
+          lib="$(ls dist/shared_libs/libpython*.so.1.0 | head -n1)"
+          echo "libpython: $lib"
+          readelf --version-info "$lib" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V -u | tail -n1 || true
 
       - name: Пакування архіву
         run: |
