@@ -1,0 +1,9 @@
+# Залежності застосунків SKKK (потрібні для збірки через PyInstaller).
+#
+# tkinter — частина стандартної бібліотеки Python, у pip не встановлюється.
+# На Linux потрібен системний пакет python3-tk (див. .github/workflows/build.yml).
+Pillow>=10.0
+mss>=9.0
+
+# Інструмент збірки
+pyinstaller>=6.0

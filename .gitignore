@@ -1,0 +1,16 @@
+# Збірки PyInstaller
+build/
+build_student/
+dist/
+*.spec
+
+# Кеш Python
+__pycache__/
+*.py[cod]
+
+# Локальні секрети та налаштування (НЕ комітити!)
+classroom_token.txt
+classroom_config.json
+
+# Архіви релізів
+SKKK-*.zip

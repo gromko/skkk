@@ -7,6 +7,7 @@ import math
 import os
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -23,14 +24,19 @@ from common import (FILE_CHUNK, MAX_FILES_PER_SEND, MAX_MESSAGE_CHARS, MSG_DEMO,
                     MSG_POWER, MSG_POWER_STATE,
                     MSG_STOP, MSG_TEXT,
                     MSG_VIDEO_RESULT, MSG_VIDEO_STOP, MSG_YOUTUBE,
+                    app_dir,
+                    app_icon_path,
                     build_announcement,
-                    capture_jpeg, ensure_firewall_port, ensure_time_sync,
-                    format_size, generate_token,
+                    bundle_dir,
+                    capture_jpeg,
+                    format_size,
                     is_risky_file, is_video_file, is_youtube_url,
                     load_config, load_token, local_broadcast_targets,
                     new_mss,
-                    parse_query, recv_packet,
-                    save_token, send_packet, server_handshake, token_file_path,
+                    parse_query, program_command, program_path,
+                    recv_packet,
+                    ROLE_NET,
+                    send_packet, server_handshake, setup_complete, token_file_path,
                     MIN_TOKEN_LEN)
 
 CFG = load_config()
@@ -55,7 +61,8 @@ ROWS = 3
 CARD_W = 236
 CARD_H = 226
 REFRESH_MS = 500
-IMG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "img")
+IMG_DIR = os.path.join(str(bundle_dir()), "img")
+_ICON_DEBUG = bool(os.environ.get("SKKK_DEBUG_ICONS"))
 
 # ---------------------------------------------------------------------------
 # Кольорова палітра теми
@@ -285,6 +292,8 @@ class ScreenViewer:
         self.locked_addrs = set()
         self.input_blocked_addrs = set()
         self.net_blocked_addrs = set()
+        self.net_state = {}        # address -> {"state","mode","error"}
+        self.net_clients = {}      # address -> привілейований клієнт netguard
 
         self.large_windows = {}
 
@@ -313,6 +322,10 @@ class ScreenViewer:
     # ------------------------------------------------------------------
     def _build_icons(self):
         """Завантажує PNG-іконки із теки img/ у двох розмірах (28 і 20)."""
+        if _ICON_DEBUG:
+            print(f"[icons] IMG_DIR={IMG_DIR!r} exists={os.path.isdir(IMG_DIR)} "
+                  f"files={len(os.listdir(IMG_DIR)) if os.path.isdir(IMG_DIR) else 0}",
+                  file=sys.stderr)
         files = {
             "demo":    "share_screen.png",
             "stop":    "stop.png",
@@ -359,7 +372,10 @@ class ScreenViewer:
             img = Image.open(os.path.join(IMG_DIR, filename)).convert("RGBA")
             img = img.resize((size, size), resample)
             photo = ImageTk.PhotoImage(img)
-        except Exception:
+        except Exception as exc:
+            if _ICON_DEBUG:
+                print(f"[icons] _load_icon {filename}@{size} FAILED: {exc!r}",
+                      file=sys.stderr)
             photo = None
         self._icon_cache[key] = photo
         return photo
@@ -396,7 +412,10 @@ class ScreenViewer:
                 img = Image.open(path).convert("RGBA")
                 img = img.resize((40, 40), resample)
                 self._btn_icons[name] = ImageTk.PhotoImage(img)
-            except Exception:
+            except Exception as exc:
+                if _ICON_DEBUG:
+                    print(f"[icons] _load_button_icons {name} ({filename}) FAILED: "
+                          f"{exc!r}", file=sys.stderr)
                 self._btn_icons[name] = self._icons.get(fallback + "_sm")
 
     # ------------------------------------------------------------------
@@ -745,10 +764,14 @@ class ScreenViewer:
         wake = threading.Event()
         try:
             conn.settimeout(15)
-            name = server_handshake(conn, self.token)
-            if name is None:
+            hello = server_handshake(conn, self.token)
+            if hello is None:
                 return
+            name, role = hello
             name = name or addr[0]
+            if role == ROLE_NET:
+                self.serve_net_client(conn, addr, name)
+                return
             with self.lock:
                 self.clients[client_id] = {
                     "name": name, "image": None, "seen": time.time(),
@@ -757,7 +780,6 @@ class ScreenViewer:
                     "locked": False, "lock_mode": "",
                     "input_locked": False, "input_mode": "",
                     "power": {"state": "none", "deadline": None, "error": ""},
-                    "net": {"state": "none", "mode": "", "error": ""},
                 }
                 registered = True
             threading.Thread(target=self.writer_loop,
@@ -779,8 +801,6 @@ class ScreenViewer:
                     self.on_input_state(client_id, packet[1:])
                 elif kind == MSG_POWER_STATE:
                     self.on_power_state(client_id, packet[1:])
-                elif kind == MSG_NET_STATE:
-                    self.on_net_state(client_id, packet[1:])
                 elif kind == MSG_VIDEO_RESULT:
                     self.on_video_result(client_id, packet[1:])
         except (OSError, ValueError, ConnectionError, json.JSONDecodeError,
@@ -889,6 +909,91 @@ class ScreenViewer:
             if client:
                 client["pending"] = packet
                 client["wake"].set()
+
+    # ------------------------------------------------------------------
+    # Привілейований клієнт керування інтернетом (netguard)
+    # ------------------------------------------------------------------
+    def serve_net_client(self, conn, addr, name):
+        """Обслуговує окреме підключення netguard (роль «net») для адреси addr[0].
+
+        Netguard лише отримує MSG_NET і повідомляє MSG_NET_STATE — екран і файли
+        він не передає, тому не реєструється серед звичайних клієнтів."""
+        address = addr[0]
+        alive = threading.Event()
+        wake = threading.Event()
+        try:
+            conn.settimeout(90)
+            with self.lock:
+                old = self.net_clients.pop(address, None)
+                if old is not None:
+                    try:
+                        old["conn"].close()
+                    except OSError:
+                        pass
+                self.net_clients[address] = {
+                    "name": name, "seen": time.time(), "address": address,
+                    "conn": conn, "wake": wake, "outbox": [],
+                }
+                desired = address in self.net_blocked_addrs
+                state = self.net_state.get(address)
+            if state and state.get("state") == "blocked":
+                self.net_blocked_addrs.add(address)
+            elif state is None:
+                self.net_state.setdefault(address, {"state": "none", "mode": "",
+                                                    "error": ""})
+            threading.Thread(target=self.net_writer_loop,
+                             args=(address, conn, wake, alive),
+                             daemon=True).start()
+            if desired and not (state and state.get("state") == "blocked"):
+                self.send_net_to(address, True)
+            while self.running:
+                packet = recv_packet(conn)
+                if packet[:1] == MSG_NET_STATE:
+                    self.on_net_state_addr(address, packet[1:])
+        except (OSError, ValueError, ConnectionError, json.JSONDecodeError,
+                KeyError, TypeError, AttributeError):
+            pass
+        finally:
+            alive.set()
+            wake.set()
+            with self.lock:
+                current = self.net_clients.get(address)
+                if current and current["conn"] is conn:
+                    self.net_clients.pop(address, None)
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def net_writer_loop(self, address, conn, wake, alive):
+        try:
+            while self.running and not alive.is_set():
+                with self.lock:
+                    client = self.net_clients.get(address)
+                    packets = []
+                    if client and client["conn"] is conn:
+                        packets, client["outbox"] = client["outbox"], []
+                for packet in packets:
+                    send_packet(conn, packet)
+                if not packets:
+                    wake.wait(1.0)
+                    wake.clear()
+        except (OSError, ValueError, ConnectionError):
+            pass
+        finally:
+            alive.set()
+
+    def send_net_to(self, address, blocked):
+        """Надсилає MSG_NET привілейованому клієнту за адресою. True — якщо
+        клієнт підключений (запит поставлено в чергу)."""
+        packet = MSG_NET + (b"\x01" if blocked else b"\x00")
+        with self.lock:
+            client = self.net_clients.get(address)
+            if not client:
+                return False
+            client["outbox"].append(packet)
+            client["wake"].set()
+            return True
 
     # ------------------------------------------------------------------
     # Текстові повідомлення
@@ -1853,24 +1958,27 @@ class ScreenViewer:
                 f"Заблокувати вихід в інтернет на всіх ({len(ids)})? "
                 "Локальна мережа та зв'язок із цим комп'ютером залишаться."):
             return
-        packet = MSG_NET + (b"\x01" if blocked else b"\x00")
         with self.lock:
-            for cid in ids:
-                client = self.clients.get(cid)
-                if client:
-                    client["outbox"].append(packet)
-                    client["wake"].set()
-                    if blocked:
-                        self.net_blocked_addrs.add(client["address"])
-                    else:
-                        self.net_blocked_addrs.discard(client["address"])
-        if not blocked:
-            if mode == "all":
-                self.net_blocked_addrs.clear()
-            elif mode == "selected":
-                self.net_blocked_addrs -= self.selected
+            addresses = {self.clients[cid]["address"] for cid in ids
+                         if cid in self.clients}
+            if not blocked and mode == "all":
+                addresses |= set(self.net_blocked_addrs)
+            if blocked:
+                self.net_blocked_addrs |= addresses
+            else:
+                self.net_blocked_addrs -= addresses
 
-    def on_net_state(self, client_id, payload):
+        missing = [address for address in addresses
+                   if not self.send_net_to(address, blocked)]
+        if missing:
+            messagebox.showinfo(
+                "Інтернет",
+                f"Немає підключеної служби керування інтернетом (netguard) "
+                f"для {len(missing)} комп'ютер(ів).\n"
+                "Запустіть netguard на цих комп'ютерах — тоді блокування "
+                "працюватиме.")
+
+    def on_net_state_addr(self, address, payload):
         try:
             report = json.loads(payload.decode("utf-8"))
             state = str(report["state"])
@@ -1880,33 +1988,34 @@ class ScreenViewer:
         except (ValueError, KeyError, TypeError, AttributeError):
             return
         with self.lock:
-            client = self.clients.get(client_id)
-            if not client:
-                return
-            client["net"] = {"state": state, "mode": mode, "error": error}
-            address = client["address"]
-            if mode == "unsupported":
+            self.net_state[address] = {"state": state, "mode": mode, "error": error}
+            if mode == "unsupported" or state == "error":
                 self.net_blocked_addrs.discard(address)
-            elif initial:
-                if state == "blocked":
-                    self.net_blocked_addrs.add(address)
-                elif address in self.net_blocked_addrs:
-                    client["outbox"].append(MSG_NET + b"\x01")
-                    client["wake"].set()
+                return
+            desired = address in self.net_blocked_addrs
+            if state == "blocked":
+                self.net_blocked_addrs.add(address)
+        if not initial:
+            return
+        # узгоджуємо реальний стан фаєрвола з наміром учителя
+        if state == "blocked" and not desired:
+            self.send_net_to(address, False)
+        elif state != "blocked" and desired:
+            self.send_net_to(address, True)
 
     @staticmethod
-    def net_badge(item, desired):
+    def net_badge(state, desired, has_client):
         """Повертає (текст, колір, назва_файлу_іконки)."""
-        net = item["net"]
-        if net["state"] == "blocked":
+        if state and state["state"] == "blocked":
             return "Інтернет заблоковано", PALETTE["danger"], "lock_web.png"
-        if net["state"] == "working":
+        if state and state["state"] == "working":
             return "Застосовується…", PALETTE["warning"], "globe.png"
+        if desired and not has_client:
+            return ("Немає netguard", PALETTE["warning"], "warning.png")
         if desired:
             return "Блокування інтернету…", PALETTE["danger"], "lock_web.png"
-        if net["mode"] == "unsupported" or net["state"] == "error":
-            return ("Блокування інтернету недоступне: " + (
-                    net["error"] or "помилка"), PALETTE["warning"], "warning.png")
+        if state and (state["mode"] == "unsupported" or state["state"] == "error"):
+            return ("Блокування недоступне", PALETTE["warning"], "warning.png")
         return "", PALETTE["text"], None
 
     # ------------------------------------------------------------------
@@ -2353,18 +2462,27 @@ class ScreenViewer:
         # Бейджі стану
         badges = tk.Frame(frame, bg=PALETTE["surface"])
         badges.pack(fill="x", padx=8, pady=(0, 6))
+        
         row1 = tk.Frame(badges, bg=PALETTE["surface"])
         row1.pack(fill="x")
+        
         badge_lock = ttk.Label(row1, text="", foreground=PALETTE["text"])
         badge_lock.pack(side="left")
+        
         badge_input = ttk.Label(row1, text="", foreground=PALETTE["text"])
         badge_input.pack(side="left", padx=(8, 0))
+        
         row2 = tk.Frame(badges, bg=PALETTE["surface"])
         row2.pack(fill="x")
+        
         badge_power = ttk.Label(row2, text="", foreground=PALETTE["text"])
         badge_power.pack(side="left")
-        badge_net = ttk.Label(row2, text="", foreground=PALETTE["text"])
-        badge_net.pack(side="left", padx=(8, 0))
+        
+        row3 = tk.Frame(badges, bg=PALETTE["surface"])
+        row3.pack(fill="x")
+        
+        badge_net = ttk.Label(row1, text="", foreground=PALETTE["text"])
+        badge_net.pack(side="left")
 
         # Уся картка (крім чекбокса) відкриває повномасштабний перегляд
         self._bind_card_open(frame, client_id, skip={chk_box, thumb})
@@ -2443,6 +2561,8 @@ class ScreenViewer:
             locked_addrs = set(self.locked_addrs)
             input_blocked_addrs = set(self.input_blocked_addrs)
             net_blocked_addrs = set(self.net_blocked_addrs)
+            net_state = {k: dict(v) for k, v in self.net_state.items()}
+            net_clients = set(self.net_clients)
 
         self.status.configure(
             text=f"Підключено: {len(snapshot)}   ·   TCP {PORT}   ·   "
@@ -2507,7 +2627,9 @@ class ScreenViewer:
 
                 # Net badge
                 net_desired = item["address"] in net_blocked_addrs
-                ntext, ncolor, nicon = self.net_badge(item, net_desired)
+                ntext, ncolor, nicon = self.net_badge(
+                    net_state.get(item["address"]), net_desired,
+                    item["address"] in net_clients)
                 nsig = (ntext, nicon)
                 if nsig != card.get("last_net_text"):
                     card["net_badge"].configure(
@@ -2527,9 +2649,9 @@ class ScreenViewer:
         with self.lock:
             locked_now = sum(1 for c in self.clients.values()
                              if c["locked"] or c["address"] in self.locked_addrs)
-            net_locked_now = sum(1 for c in self.clients.values()
-                                 if c["net"]["state"] in ("blocked", "working")
-                                 or c["address"] in self.net_blocked_addrs)
+            net_locked_now = len(self.net_blocked_addrs | {
+                a for a, s in self.net_state.items()
+                if s.get("state") in ("blocked", "working")})
 
         if net_locked_now and not locked_now:
             answer = messagebox.askyesnocancel(
@@ -2558,9 +2680,9 @@ class ScreenViewer:
                 time.sleep(0.7)
 
         with self.lock:
-            net_locked_now = sum(1 for c in self.clients.values()
-                                 if c["net"]["state"] in ("blocked", "working")
-                                 or c["address"] in self.net_blocked_addrs)
+            net_locked_now = len(self.net_blocked_addrs | {
+                a for a, s in self.net_state.items()
+                if s.get("state") in ("blocked", "working")})
         if net_locked_now:
             net_answer = messagebox.askyesnocancel(
                 "Заблокований інтернет",
@@ -2586,93 +2708,72 @@ class ScreenViewer:
         self.root.destroy()
 
 
-def _check_firewall(root, port, proto="tcp"):
-    """На старті перевіряє, чи відкрито вхідний порт, і за потреби відкриває
-    його у фаєрволі (з підвищенням прав). Показує результат лише тоді, коли
-    щось змінено або потрібна ручна дія."""
-    def explain(_why):
-        messagebox.showinfo("Права адміністратора", _why, parent=root)
-    try:
-        result = ensure_firewall_port(port, proto=proto, on_elevate=explain)
-    except Exception as exc:                       # не заважаємо запуску застосунку
-        messagebox.showwarning("Фаєрвол",
-                               f"Не вдалося перевірити фаєрвол:\n{exc}", parent=root)
-        return
-    status = result.get("status")
-    if status == "ok":
-        return
-    text = result.get("message", "")
-    if result.get("command"):
-        text += f"\n\nВиконайте вручну:\n{result['command']}"
-    if status == "added":
-        messagebox.showinfo("Фаєрвол", text, parent=root)
-    else:
-        messagebox.showwarning("Фаєрвол", text, parent=root)
+SETUP_PROGRAM = "skkk_setup"
 
 
-def _check_time_sync(root):
-    """На старті вмикає автоматичну синхронізацію часу (NTP). Показує
-    повідомлення лише тоді, коли щось змінено або потрібна ручна дія."""
-    def explain(_why):
-        messagebox.showinfo("Права адміністратора", _why, parent=root)
-    try:
-        result = ensure_time_sync(on_elevate=explain)
-    except Exception as exc:
-        print(f"Не вдалося перевірити синхронізацію часу: {exc}", file=sys.stderr)
-        return
-    status = result.get("status")
-    if status in ("ok", "unsupported"):
-        return
-    text = result.get("message", "")
-    if result.get("command"):
-        text += f"\n\nВиконайте вручну:\n{result['command']}"
-    if status == "added":
-        messagebox.showinfo("Синхронізація часу", text, parent=root)
-    else:
-        messagebox.showwarning("Синхронізація часу", text, parent=root)
-
-
-def _load_or_create_token(root):
-    """Бере токен із файлу. Якщо файлу немає — створює новий випадковий токен
-    і повідомляє, куди його збережено (щоб скопіювати на комп'ютери учнів)."""
+def _setup_needed():
+    """Чи потрібно перед стартом запустити майстер налаштування середовища."""
     token = load_token()
-    if token is None:
-        token = generate_token()
-        try:
-            path = save_token(token)
-        except OSError as exc:
-            messagebox.showerror("Токен доступу",
-                                 f"Не вдалося створити файл токена:\n{exc}",
-                                 parent=root)
-            return None
-        messagebox.showinfo(
-            "Токен доступу",
-            f"Створено новий токен доступу:\n\n{token}\n\n"
-            f"Його збережено у файлі:\n{path}\n\n"
-            "Скопіюйте цей файл на комп'ютери учнів (або покладіть такий самий "
-            "classroom_token.txt поряд з агентом учня).",
+    if token is None or len(token) < MIN_TOKEN_LEN:
+        return True
+    return not setup_complete()
+
+
+def _run_setup(root):
+    """Запускає майстер налаштування (skkk_setup.py з вихідного коду або
+    skkk_setup.exe поруч для зібраного застосунку) і чекає на завершення."""
+    target = program_path(SETUP_PROGRAM)
+    if not target.exists():
+        messagebox.showwarning(
+            "Налаштування середовища",
+            f"Не знайдено майстер налаштування:\n{target}",
             parent=root)
-    elif len(token) < MIN_TOKEN_LEN:
+        return
+    root.withdraw()
+    try:
+        subprocess.run(program_command(SETUP_PROGRAM, "--no-launch"),
+                       cwd=str(app_dir()), check=False)
+    except OSError as exc:
         messagebox.showerror(
-            "Токен доступу",
-            f"Токен у файлі\n{token_file_path()}\n"
-            f"коротший за {MIN_TOKEN_LEN} символів.",
-            parent=root)
-        return None
-    return token
+            "Налаштування середовища",
+            f"Не вдалося запустити майстер налаштування:\n{exc}", parent=root)
+    finally:
+        if root.winfo_exists():
+            root.deiconify()
+            root.update_idletasks()
+
+
+def _set_window_icon(root):
+    """Встановлює іконку вікна з icon.png (якщо файл доступний)."""
+    path = app_icon_path()
+    if path is None:
+        return
+    try:
+        photo = tk.PhotoImage(file=str(path))
+        root.iconphoto(True, photo)
+        root._app_icon = photo  # тримаємо посилання, щоб не зібрало GC
+    except Exception as exc:
+        if _ICON_DEBUG:
+            print(f"[icons] window icon {path} FAILED: {exc!r}", file=sys.stderr)
 
 
 def main():
     root = tk.Tk()
     root.withdraw()
     _configure_theme()
-    token = _load_or_create_token(root)
-    if token is None:
+    _set_window_icon(root)
+    if _setup_needed():
+        _run_setup(root)
+    token = load_token()
+    if token is None or len(token) < MIN_TOKEN_LEN:
+        messagebox.showerror(
+            "Токен доступу",
+            "Токен доступу не знайдено або він закороткий.\n\n"
+            f"Файл: {token_file_path()}\n\n"
+            "Запустіть skkk_setup.py для налаштування середовища.",
+            parent=root)
         root.destroy()
         return
-    _check_time_sync(root)
-    _check_firewall(root, PORT, "tcp")
-    _check_firewall(root, DISCOVERY_PORT, "udp")
     root.deiconify()
     ScreenViewer(root, token)
     root.mainloop()

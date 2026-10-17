@@ -27,19 +27,19 @@ from PIL import Image
 from common import (MAX_FRAME_BYTES, MAX_MESSAGE_CHARS, MSG_DEMO, MSG_FILE_DATA,
                     MSG_FILE_END, MSG_FILE_RESULT, MSG_FILE_START, MSG_FRAME,
                     MSG_INPUT, MSG_INPUT_STATE, MSG_LOCK, MSG_LOCK_STATE,
-                    MSG_NET, MSG_NET_STATE, MSG_POWER,
+                    MSG_POWER,
                     MSG_POWER_STATE, MSG_STOP, MSG_TEXT, MIN_TOKEN_LEN,
                     MSG_VIDEO_RESULT, MSG_VIDEO_STOP, MSG_YOUTUBE,
-                    build_query, capture_jpeg,
+                    app_dir, app_icon_path,
+                    capture_jpeg,
                     client_handshake, default_save_dir, ensure_firewall_port,
                     ensure_time_sync,
                     format_size,
                     is_risky_file, is_video_file, is_youtube_url,
-                    load_config, load_token, local_broadcast_targets,
-                    find_teacher_tcp, local_subnet_hosts, new_mss,
-                    parse_announcement, parse_query,
+                    load_config, load_token, new_mss, discover_teacher,
+                    program_command, program_path,
                     recv_packet, safe_filename, send_packet, token_file_path,
-                    _which)
+                    student_setup_complete)
 
 try:
     import tkinter as tk
@@ -52,184 +52,6 @@ if tk is not None:
         from PIL import ImageTk
     except ImportError:  # Pillow без підтримки Tk — немає показу демонстрації
         ImageTk = None
-
-
-class NetworkGuard:
-    """Блокує вихід в інтернет, залишаючи локальну мережу (і завжди — комп'ютер
-    вчителя) доступними. Потребує прав адміністратора (Windows) або root (Linux):
-    без них повертає mode="unsupported" і причину.
-
-    Windows: один блокувальний правило фаєрвола на вихідний трафік із
-             remoteip=Internet — цей вбудований діапазон Windows навмисно не
-             включає локальну підмережу, тож LAN-трафік ним не зачіпається.
-    Linux:   окремий ланцюжок iptables/ip6tables у OUTPUT: приватні діапазони
-             (RFC1918), link-local, multicast, broadcast і IP вчителя явно
-             пропускаються (RETURN), усе інше — DROP.
-    """
-    RULE_NAME = "ClassroomAgentBlockInternet"
-    CHAIN4 = "CLASSROOM_NET"
-    CHAIN6 = "CLASSROOM_NET6"
-    PRIVATE_V4 = ["127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                 "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255/32"]
-    PRIVATE_V6 = ["::1/128", "fc00::/7", "fe80::/10", "ff00::/8"]
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self.teacher_ip = None
-        self.state = "none"     # none | working | blocked | error
-        self.mode = ""
-        self.error = ""
-        self.version = 0
-        self.applied_at = 0.0   # час останнього успішного блокування — для запобіжника
-
-    def snapshot(self):
-        with self._lock:
-            return self.version, self.state, self.mode, self.error
-
-    def _set(self, state, mode=None, error=""):
-        with self._lock:
-            self.state = state
-            if mode is not None:
-                self.mode = mode
-            self.error = error
-            self.version += 1
-            if state == "blocked":
-                self.applied_at = time.time()
-
-    def request(self, want_block):
-        threading.Thread(target=self._run, args=(bool(want_block),), daemon=True).start()
-
-    def _run(self, want_block):
-        self._set("working")
-        try:
-            if want_block:
-                ok, mode, error = self._block()
-            else:
-                ok, mode, error = self._unblock()
-        except Exception as exc:
-            ok, mode, error = False, self.mode or "unsupported", str(exc)[:200]
-        if ok:
-            self._set("blocked" if want_block else "none", mode, "")
-        else:
-            self._set("error", mode, error or "Помилка")
-
-    # ---------- платформозалежна реалізація ----------
-    def _block(self):
-        system = platform.system()
-        if system == "Windows":
-            return self._block_windows()
-        if system == "Linux":
-            return self._block_linux()
-        return False, "unsupported", f"Непідтримувана ОС: {system}"
-
-    def _unblock(self):
-        system = platform.system()
-        if system == "Windows":
-            return self._unblock_windows()
-        if system == "Linux":
-            return self._unblock_linux()
-        return True, self.mode or "unsupported", ""
-
-    @staticmethod
-    def _run_cmd(cmd, timeout=10):
-        flags = 0x08000000 if sys.platform == "win32" else 0   # CREATE_NO_WINDOW
-        cmd = list(cmd)
-        env = None
-        if os.name == "posix":
-            if cmd and "/" not in cmd[0]:
-                resolved = _which(cmd[0])
-                if resolved:
-                    cmd[0] = resolved
-            env = dict(os.environ)
-            env["PATH"] = (env.get("PATH", "") + ":" +
-                           "/usr/sbin:/sbin:/usr/local/sbin").strip(":")
-        try:
-            return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                                  creationflags=flags, env=env)
-        except FileNotFoundError:
-            return None
-        except subprocess.SubprocessError as exc:
-            class _Fail:
-                returncode = 1
-                stdout = ""
-                stderr = str(exc)
-            return _Fail()
-
-    # ---------- Windows ----------
-    def _is_admin_windows(self):
-        try:
-            return bool(ctypes.windll.shell32.IsUserAnAdmin())
-        except Exception:
-            return False
-
-    def _block_windows(self):
-        if not self._is_admin_windows():
-            return False, "unsupported", ("Потрібні права адміністратора. Запустіть агент "
-                                          "від імені адміністратора, щоб керувати фаєрволом.")
-        self._run_cmd(["netsh", "advfirewall", "firewall", "delete", "rule",
-                      f"name={self.RULE_NAME}"])   # прибираємо дублікати від попередніх спроб
-        result = self._run_cmd(["netsh", "advfirewall", "firewall", "add", "rule",
-                               f"name={self.RULE_NAME}", "dir=out", "action=block",
-                               "remoteip=Internet", "profile=any", "protocol=any", "enable=yes"])
-        if result is None:
-            return False, "unsupported", "Команду netsh не знайдено"
-        if result.returncode != 0:
-            return False, "windows_firewall", (result.stderr or result.stdout).strip()[:200]
-        return True, "windows_firewall", ""
-
-    def _unblock_windows(self):
-        for _ in range(5):
-            result = self._run_cmd(["netsh", "advfirewall", "firewall", "delete", "rule",
-                                   f"name={self.RULE_NAME}"])
-            if result is None:
-                return True, "windows_firewall", ""   # netsh відсутній — блокувати теж не могли
-            if result.returncode != 0:
-                break
-        return True, "windows_firewall", ""
-
-    # ---------- Linux ----------
-    @staticmethod
-    def _geteuid():
-        return getattr(os, "geteuid", lambda: 1000)()
-
-    def _block_linux(self):
-        if self._geteuid() != 0:
-            return False, "unsupported", ("Потрібні права root. Запустіть агент через sudo "
-                                          "або як системну службу, щоб керувати фаєрволом.")
-        if _which("iptables") is None:
-            return False, "unsupported", "Команду iptables не знайдено"
-        ok4 = self._apply_chain_linux("iptables", self.CHAIN4, self.PRIVATE_V4, include_teacher=True)
-        if _which("ip6tables") is not None:
-            self._apply_chain_linux("ip6tables", self.CHAIN6, self.PRIVATE_V6, include_teacher=False)
-        if not ok4:
-            return False, "linux_iptables", "Не вдалося застосувати правила iptables"
-        return True, "linux_iptables", ""
-
-    def _apply_chain_linux(self, binary, chain, private_ranges, include_teacher):
-        self._run_cmd([binary, "-N", chain])            # існує — помилку ігноруємо
-        self._run_cmd([binary, "-F", chain])
-        for net in private_ranges:
-            self._run_cmd([binary, "-A", chain, "-d", net, "-j", "RETURN"])
-        if include_teacher and self.teacher_ip:
-            self._run_cmd([binary, "-A", chain, "-d", f"{self.teacher_ip}/32", "-j", "RETURN"])
-        self._run_cmd([binary, "-A", chain, "-j", "DROP"])
-        check = self._run_cmd([binary, "-C", "OUTPUT", "-j", chain])
-        if check and check.returncode != 0:
-            self._run_cmd([binary, "-I", "OUTPUT", "1", "-j", chain])
-        check = self._run_cmd([binary, "-C", "OUTPUT", "-j", chain])
-        return bool(check) and check.returncode == 0
-
-    def _unblock_linux(self):
-        for binary, chain in (("iptables", self.CHAIN4), ("ip6tables", self.CHAIN6)):
-            if _which(binary) is None:
-                continue
-            for _ in range(5):
-                result = self._run_cmd([binary, "-D", "OUTPUT", "-j", chain])
-                if result is None or result.returncode != 0:
-                    break
-            self._run_cmd([binary, "-F", chain])
-            self._run_cmd([binary, "-X", chain])
-        return True, "linux_iptables", ""
 
 
 class PowerManager:
@@ -1501,7 +1323,7 @@ class FileReceiver:
                         f"\n\nЗбережено в папці:\n{self.save_dir}")
 
 
-def receiver(sock, viewer, dead, stop_event, files, send, power, net, media=None):
+def receiver(sock, viewer, dead, stop_event, files, send, power, media=None):
     """Читає пакети від вчителя (кадри демонстрації / сигнал завершення)."""
     try:
         while not dead.is_set() and not stop_event.is_set():
@@ -1516,9 +1338,6 @@ def receiver(sock, viewer, dead, stop_event, files, send, power, net, media=None
                     viewer.message(text)
                 else:
                     print(f"\n=== Повідомлення від вчителя ===\n{text}\n", flush=True)
-                continue
-            if kind == MSG_NET:
-                net.request(data[:1] == b"\x01")
                 continue
             if kind == MSG_POWER:
                 try:
@@ -1583,108 +1402,7 @@ def receiver(sock, viewer, dead, stop_event, files, send, power, net, media=None
             viewer.stop()    # зв'язок втрачено — закриваємо вікно демонстрації
 
 
-def discover_teacher(token, discovery_port, stop_event, tcp_port=None):
-    """Шукає вчителя: слухає його UDP-оголошення, надсилає підписаний запит
-    «де вчитель?» (широкомовленням) і, якщо це не дає відповіді, перебирає
-    адреси підмережі напряму (коли широкомовлення заблоковане мережею).
-    Повертає (ip, tcp_port, name) після перевірки підпису; IP береться з
-    адреси відправника пакета, а не з вмісту оголошення."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
-            try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-            except OSError:
-                pass
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind(("", discovery_port))
-        sock.settimeout(1.0)
-        if sys.platform == "win32":
-            try:    # без цього Windows кидає ConnectionResetError після ICMP «port unreachable»
-                sock.ioctl(socket.SIO_UDP_CONNRESET, False)
-            except (AttributeError, OSError, ValueError):
-                pass
-        targets = local_broadcast_targets()
-        sweep_hosts = local_subnet_hosts()
-        query = build_query(token)
-        started = time.time()
-        last_hint = started
-        last_query = 0.0
-        next_sweep = started + 4.0
-        next_tcp = started + 6.0
-        tcp_announced = False
-        sweep_announced = False
-        rejected = 0
-        while not stop_event.is_set():
-            now = time.time()
-            if now - last_query >= 2.0:       # широкомовний запит
-                last_query = now
-                for target in targets:
-                    try:
-                        sock.sendto(query, (target, discovery_port))
-                    except OSError:
-                        pass
-            # широкомовлення не дало відповіді — шукаємо перебором адрес
-            if sweep_hosts and now >= next_sweep:
-                next_sweep = now + 10.0
-                if not sweep_announced:
-                    sweep_announced = True
-                    print("Широкомовлення не дало відповіді — шукаю вчителя "
-                          "перебором адрес у підмережі…", file=sys.stderr)
-                for host in sweep_hosts:
-                    try:
-                        sock.sendto(query, (host, discovery_port))
-                    except OSError:
-                        pass
-            # UDP-відповіді не доходять (типово — вхідний UDP закрито фаєрволом) —
-            # шукаємо вчителя по TCP: вихідні TCP-з'єднання працюють завжди
-            if tcp_port and sweep_hosts and now >= next_tcp:
-                next_tcp = now + 10.0
-                if not tcp_announced:
-                    tcp_announced = True
-                    print("UDP-відповіді не надходять — пробую знайти вчителя "
-                          f"через TCP-порт {tcp_port}…", file=sys.stderr)
-                found_ip = find_teacher_tcp(token, tcp_port, sweep_hosts, stop_event)
-                if found_ip:
-                    return found_ip, tcp_port, found_ip
-            try:
-                data, addr = sock.recvfrom(2048)
-            except ConnectionResetError:         # Windows: ICMP від хоста без слухача
-                continue
-            except socket.timeout:
-                if now - last_hint > 15:
-                    last_hint = now
-                    hint = (f"Вчителя ще не знайдено ({int(now - started)} с). "
-                            f"Перевірте токен, мережу та UDP-порт {discovery_port} "
-                            f"у брандмауері.")
-                    if rejected:
-                        hint += (f" Отримано пакетів, які не пройшли перевірку: {rejected}.")
-                    print(hint, file=sys.stderr)
-                continue
-            ann = parse_announcement(token, data)
-            if ann:
-                return addr[0], ann["tcp_port"], ann["name"]
-            if parse_query(token, data):
-                continue                     # власний запит повернувся розсилкою
-            rejected += 1
-        return None
-    finally:
-        sock.close()
-
-
-def _maybe_undo_network_block(net):
-    """Якщо зв'язок із учителем обірвався невдовзі після блокування інтернету —
-    знімаємо блокування самостійно. Це запобіжник на випадок, якщо правило
-    фаєрвола непередбачено зачепило і трафік до вчителя."""
-    _version, state, _mode, _error = net.snapshot()
-    if state == "blocked" and time.time() - net.applied_at < 20:
-        print("Зв'язок із учителем втрачено одразу після блокування інтернету — "
-              "знімаю блокування як запобіжний захід.", file=sys.stderr)
-        net.request(False)
-
-
-def stream(ip, port, token, name, interval, viewer, stop_event, file_cfg, power, net):
+def stream(ip, port, token, name, interval, viewer, stop_event, file_cfg, power):
     """Одна сесія. Повертає False, якщо автентифікація не пройшла."""
     with socket.create_connection((ip, port), timeout=10) as sock:
         sock.settimeout(15)
@@ -1719,7 +1437,7 @@ def stream(ip, port, token, name, interval, viewer, stop_event, file_cfg, power,
                              file_cfg["allow_exec"], send, notify,
                              media=media, video_dir=video_dir)
         threading.Thread(target=receiver, args=(sock, viewer, dead, stop_event,
-                                                files, send, power, net, media),
+                                                files, send, power, media),
                          daemon=True).start()
 
         def report_lock(initial=False):
@@ -1746,15 +1464,6 @@ def stream(ip, port, token, name, interval, viewer, stop_event, file_cfg, power,
             return version
 
         last_power = report_power()
-        net.teacher_ip = ip
-
-        def report_net(initial=False):
-            version, state, mode, error = net.snapshot()
-            send(MSG_NET_STATE + json.dumps(
-                {"state": state, "mode": mode, "initial": initial, "error": error}).encode("utf-8"))
-            return version
-
-        last_net = report_net(initial=True)
         try:
             with new_mss() as sct:
                 while not stop_event.is_set() and not dead.is_set():
@@ -1768,14 +1477,11 @@ def stream(ip, port, token, name, interval, viewer, stop_event, file_cfg, power,
                         last_input = report_input()
                     if power.snapshot()[0] != last_power:
                         last_power = report_power()
-                    if net.snapshot()[0] != last_net:
-                        last_net = report_net()
                     stop_event.wait(interval)
         finally:
             dead.set()
             if viewer is not None:
                 viewer.set_connected(False)
-            _maybe_undo_network_block(net)
         if not stop_event.is_set():
             raise ConnectionError("Teacher connection lost")
         return True
@@ -1815,7 +1521,7 @@ def _ensure_time_sync(on_elevate=None):
             print(f"  Виконайте вручну: {result['command']}", file=sys.stderr)
 
 
-def run(args, token, viewer, stop_event, file_cfg, power, net):
+def run(args, token, viewer, stop_event, file_cfg, power):
     """Основний цикл: пошук вчителя → сесія → при обриві пошук знову."""
     discovery_fw_checked = False
     time_sync_checked = False
@@ -1845,7 +1551,7 @@ def run(args, token, viewer, stop_event, file_cfg, power, net):
                 ip, port, tname = found
                 print(f"Знайдено вчителя «{tname}» за адресою {ip}")
             if not stream(ip, port, token, args.name, args.interval, viewer, stop_event,
-                      file_cfg, power, net):
+                      file_cfg, power):
                 print("Автентифікація не пройдена (перевірте токен).", file=sys.stderr)
                 if args.teacher_ip:
                     return 3
@@ -1854,6 +1560,56 @@ def run(args, token, viewer, stop_event, file_cfg, power, net):
             print(f"Connection interrupted: {exc}. Retrying in 3 seconds…", file=sys.stderr)
             stop_event.wait(3)
     return 0
+
+
+SETUP_SCRIPT = program_path("skkk_student_setup")
+
+
+def _has_display():
+    """Чи є графічна сесія (потрібна для вікна майстра налаштування)."""
+    if sys.platform == "win32":
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _student_setup_needed(args):
+    """Чи потрібно перед стартом запустити майстер налаштування учня."""
+    if args.token or args.token_file:
+        return False
+    token = load_token()
+    if token is None or len(token) < MIN_TOKEN_LEN:
+        return True
+    return not student_setup_complete()
+
+
+def _run_student_setup():
+    """Запускає майстер налаштування учня (skkk_student_setup) і чекає на
+    завершення. Для зібраного застосунку — сусідній виконуваний файл, для
+    вихідного коду — skkk_student_setup.py."""
+    if not SETUP_SCRIPT.exists():
+        print(f"Не знайдено майстер налаштування: {SETUP_SCRIPT}", file=sys.stderr)
+        return
+    print("Середовище ще не налаштоване — запускаю майстер налаштування…")
+    try:
+        subprocess.run(program_command("skkk_student_setup", "--no-launch"),
+                       cwd=str(app_dir()), check=False)
+    except OSError as exc:
+        print(f"Не вдалося запустити майстер налаштування: {exc}", file=sys.stderr)
+
+
+def _set_window_icon(root):
+    """Встановлює іконку вікна з icon.png (якщо файл доступний)."""
+    if tk is None:
+        return
+    path = app_icon_path()
+    if path is None:
+        return
+    try:
+        photo = tk.PhotoImage(file=str(path))
+        root.iconphoto(True, photo)
+        root._app_icon = photo  # тримаємо посилання, щоб не зібрало GC
+    except Exception:                             # noqa: BLE001
+        pass
 
 
 def main():
@@ -1878,6 +1634,9 @@ def main():
                         help="не відкривати вікна (демонстрація екрана та повідомлення вчителя); повідомлення виводяться в термінал")
     args = parser.parse_args()
 
+    if not args.no_viewer and _has_display() and _student_setup_needed(args):
+        _run_student_setup()
+
     token = args.token or load_token(args.token_file)
     if not token:
         print("Токен доступу не знайдено.\n"
@@ -1901,7 +1660,6 @@ def main():
     print(f"Файли від вчителя зберігаються в: {file_cfg['save_dir']}")
     stop_event = threading.Event()
     power = PowerManager(cfg["shutdown_min_delay_seconds"])
-    net = NetworkGuard()
 
     root = None
     if tk is not None and not args.no_viewer:
@@ -1916,6 +1674,7 @@ def main():
         try:
             root = tk.Tk()
             root.withdraw()
+            _set_window_icon(root)
         except tk.TclError as exc:
             print(f"Вікно демонстрації недоступне ({exc}); працюю без нього.", file=sys.stderr)
             root = None
@@ -1933,7 +1692,7 @@ def main():
 
     if root is None:
         try:
-            return run(args, token, None, stop_event, file_cfg, power, net)
+            return run(args, token, None, stop_event, file_cfg, power)
         except KeyboardInterrupt:
             print("\nScreen sharing stopped.")
             return 0
@@ -1945,7 +1704,7 @@ def main():
 
     def worker():
         try:
-            result[0] = run(args, token, viewer, stop_event, file_cfg, power, net)
+            result[0] = run(args, token, viewer, stop_event, file_cfg, power)
         finally:
             done.set()
 

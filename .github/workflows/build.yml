@@ -1,0 +1,176 @@
+name: Build SKKK
+
+# Збірка застосунків для Windows, Linux і macOS одним workflow.
+#
+#  * push тегу v*            -> збірка + GitHub Release
+#  * ручний запуск (Actions) -> збірка + GitHub Release з указаним тегом
+#  * pull_request            -> лише збірка (артефакти, без релізу)
+on:
+  push:
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Тег релізу (створиться, якщо не існує), напр. v1.0.0'
+        required: true
+        default: 'v1.0.0'
+
+# Потрібно для створення релізу (GITHUB_TOKEN).
+permissions:
+  contents: write
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Windows: teacher, skkk_setup, student_agent, skkk_student_setup, netguard
+  # --------------------------------------------------------------------------
+  build-windows:
+    name: Windows (.exe)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Встановити залежності
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Збірка teacher + skkk_setup
+        shell: cmd
+        run: call build_exe.bat
+
+      - name: Збірка student-застосунків (netguard, agent, setup)
+        shell: cmd
+        run: call build_exe_student.bat
+
+      - name: Пакування архіву
+        shell: pwsh
+        run: Compress-Archive -Path dist\* -DestinationPath SKKK-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skkk-windows
+          path: SKKK-windows.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Linux: використовуємо системний Python + python3-tk (tkinter у venv)
+  # --------------------------------------------------------------------------
+  build-linux:
+    name: Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Системні залежності (tkinter)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk python3-venv
+
+      - name: Збірка
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          chmod +x build_exe.sh build_exe_student.sh
+          ./build_exe.sh
+          ./build_exe_student.sh
+
+      - name: Перевірка, що застосунки бачать спільну теку бібліотек
+        run: |
+          test -x dist/netguard && test -d dist/shared_libs
+          test -x dist/student/student_agent && test -d dist/student/shared_libs
+          echo "ОК: shared_libs на місці"
+
+      - name: Пакування архіву
+        run: |
+          cd dist
+          zip -r -y ../SKKK-linux.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skkk-linux
+          path: SKKK-linux.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # macOS: окрім .app-бандлів створюється і звичайний onedir з shared_libs
+  # --------------------------------------------------------------------------
+  build-macos:
+    name: macOS
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Встановити залежності
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Перевірка tkinter
+        run: python -c "import tkinter; print('Tk', tkinter.TkVersion)"
+
+      - name: Збірка
+        run: |
+          chmod +x build_exe.sh build_exe_student.sh
+          ./build_exe.sh
+          ./build_exe_student.sh
+
+      - name: Пакування архіву
+        run: |
+          cd dist
+          zip -r -y ../SKKK-macos.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: skkk-macos
+          path: SKKK-macos.zip
+          if-no-files-found: error
+
+  # --------------------------------------------------------------------------
+  # Реліз: завантажує всі артефакти та прикріплює їх до GitHub Release
+  # --------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    needs: [build-windows, build-linux, build-macos]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Завантажити всі артефакти
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Визначити тег релізу
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "value=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Створити реліз і прикріпити артефакти
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: SKKK ${{ steps.tag.outputs.value }}
+          files: artifacts/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

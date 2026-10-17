@@ -17,12 +17,97 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
 
-import mss
-from PIL import Image
+
+# ---------- Шляхи для запуску з вихідного коду та зібраного PyInstaller ----------
+
+def is_frozen():
+    """True, якщо код зібрано PyInstaller (або іншим «заморожувачем»)."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def app_dir():
+    """Тека для зовнішніх файлів (classroom_config.json, classroom_token.txt,
+    сусідні програми). Для зібраного застосунку — тека поряд із виконуваним
+    файлом; для запуску з вихідного коду — тека зі скриптами (common.py)."""
+    if is_frozen():
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def bundle_dir():
+    """Тека з вбудованими ресурсами (теки даних, напр. img/). У PyInstaller
+    onefile це тимчасова тека розпакування (sys._MEIPASS); у onedir — теж
+    _MEIPASS; без збірки — тека зі скриптами."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass)
+    return app_dir()
+
+
+def app_icon_path():
+    """Шлях до іконки застосунку (icon.png): поряд із виконуваним файлом
+    (app_dir) або серед вбудованих ресурсів (bundle_dir). Повертає Path або None."""
+    for base in (bundle_dir(), app_dir()):
+        candidate = Path(base) / "icon.png"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def program_path(name):
+    """Шлях до сусідньої програми SKKK (name без розширення): сусідній .exe
+    для зібраного застосунку або .py-скрипт поряд."""
+    if is_frozen():
+        ext = ".exe" if os.name == "nt" else ""
+        return app_dir() / (name + ext)
+    return app_dir() / (name + ".py")
+
+
+def program_command(name, *args):
+    """Команда для запуску сусідньої програми. Для зібраного застосунку —
+    прямий запуск .exe; для вихідного коду — через поточний інтерпретатор."""
+    if is_frozen():
+        return [str(program_path(name)), *args]
+    return [sys.executable, str(program_path(name)), *args]
+
+
+def program_exists(name):
+    """Чи існує файл сусідньої програми, який потрібно запускати."""
+    return program_path(name).exists()
+
+
+def module_available(name):
+    """Чи доступний модуль для імпорту.
+
+    У зібраному застосунку окремий процес ``sys.executable`` запустити
+    неможливо (це той самий застосунок), тому перевіряємо через importlib.
+    Поза збіркою запускаємо окремий інтерпретатор, щоб «побачити» щойно
+    встановлені пакети (вони потрапляють у sys.path лише нового процесу)."""
+    if is_frozen():
+        try:
+            import importlib
+            import importlib.util
+            importlib.invalidate_caches()
+            return importlib.util.find_spec(name) is not None
+        except (ImportError, AttributeError, ValueError):
+            return False
+    try:
+        result = subprocess.run([sys.executable, "-c", f"import {name}"],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
 
 SERVICE = "classroom-screen-viewer"
 PROTO_VERSION = 1
 MAX_FRAME_BYTES = 8 * 1024 * 1024
+
+# Роль клієнта в рукостисканні. "agent" — звичайний агент учня (екран, файли,
+# блокування екрана/введення, вимкнення). "net" — окремий привілейований
+# клієнт netguard, що керує лише блокуванням виходу в інтернет.
+ROLE_AGENT = "agent"
+ROLE_NET = "net"
 
 # Тип повідомлення = перший байт кожного пакета після рукостискання
 MSG_FRAME = b"F"   # учень -> вчитель: кадр екрана учня
@@ -109,9 +194,21 @@ DEFAULTS = {
 
 
 def load_config(path=None):
-    """Читає classroom_config.json (необов'язковий) поверх значень за замовчуванням."""
+    """Читає classroom_config.json (необов'язковий) поверх значень за замовчуванням.
+
+    Порядок пошуку файла: явний аргумент, змінна середовища CLASSROOM_CONFIG,
+    тека застосунку (поряд із .exe для зібраного PyInstaller), поточна тека."""
     cfg = dict(DEFAULTS)
-    path = path or os.environ.get("CLASSROOM_CONFIG", "classroom_config.json")
+    if path is None:
+        path = os.environ.get("CLASSROOM_CONFIG")
+    if not path:
+        for candidate in (app_dir() / "classroom_config.json",
+                          Path.cwd() / "classroom_config.json"):
+            if candidate.exists():
+                path = str(candidate)
+                break
+        else:
+            path = str(app_dir() / "classroom_config.json")
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
             cfg.update(json.load(f))
@@ -148,7 +245,7 @@ def token_file_path(path=None):
     env = os.environ.get("CLASSROOM_TOKEN_FILE")
     if env:
         return env
-    return str(Path(__file__).resolve().parent / TOKEN_FILE_NAME)
+    return str(app_dir() / TOKEN_FILE_NAME)
 
 
 def load_token(path=None):
@@ -179,6 +276,71 @@ def save_token(token, path=None):
 
 def generate_token(length=24):
     return "".join(secrets.choice(_TOKEN_CHARSET) for _ in range(length))
+
+
+# ---------- Позначка завершеного налаштування середовища ----------
+#
+# skkk_setup.py після успішної перевірки/налаштування створює цей файл, а
+# teacher.py за його наявністю вирішує, чи потрібно запускати майстер
+# налаштування перед стартом.
+
+SETUP_MARKER = Path.home() / ".config" / "classroom_screen_monitor" / "setup.json"
+
+
+def mark_setup_complete(extra=None):
+    data = {"completed": True, "time": time.time(),
+            "python": sys.version.split()[0], "platform": platform.platform()}
+    if extra:
+        data.update(extra)
+    try:
+        SETUP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        with open(SETUP_MARKER, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    return SETUP_MARKER
+
+
+def setup_complete():
+    """True, якщо майстер налаштування середовища вже успішно завершувався."""
+    try:
+        with open(SETUP_MARKER, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return bool(data.get("completed"))
+    except (OSError, ValueError):
+        return False
+
+
+# Позначка завершеного налаштування учнівського комп'ютера (skkk_student_setup.py).
+# Окремий файл, щоб налаштування вчителя й учня не перекривали одне одного.
+
+STUDENT_SETUP_MARKER = (Path.home() / ".config" / "classroom_screen_monitor"
+                        / "student_setup.json")
+
+
+def mark_student_setup_complete(extra=None):
+    data = {"completed": True, "time": time.time(),
+            "python": sys.version.split()[0], "platform": platform.platform()}
+    if extra:
+        data.update(extra)
+    try:
+        STUDENT_SETUP_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        with open(STUDENT_SETUP_MARKER, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+    return STUDENT_SETUP_MARKER
+
+
+def student_setup_complete():
+    """True, якщо майстер налаштування учнівського комп'ютера вже завершувався."""
+    try:
+        with open(STUDENT_SETUP_MARKER, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return bool(data.get("completed"))
+    except (OSError, ValueError):
+        return False
+
 
 
 # ---------- TCP-фреймінг ----------
@@ -418,13 +580,105 @@ def find_teacher_tcp(token, port, hosts, stop_event=None, workers=64, timeout=0.
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+def discover_teacher(token, discovery_port, stop_event, tcp_port=None):
+    """Шукає вчителя: слухає його UDP-оголошення, надсилає підписаний запит
+    «де вчитель?» (широкомовленням) і, якщо це не дає відповіді, перебирає
+    адреси підмережі напряму (коли широкомовлення заблоковане мережею).
+    Повертає (ip, tcp_port, name) після перевірки підпису; IP береться з
+    адреси відправника пакета, а не з вмісту оголошення."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, "SO_REUSEPORT"):
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("", discovery_port))
+        sock.settimeout(1.0)
+        if sys.platform == "win32":
+            try:    # без цього Windows кидає ConnectionResetError після ICMP «port unreachable»
+                sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+            except (AttributeError, OSError, ValueError):
+                pass
+        targets = local_broadcast_targets()
+        sweep_hosts = local_subnet_hosts()
+        query = build_query(token)
+        started = time.time()
+        last_hint = started
+        last_query = 0.0
+        next_sweep = started + 4.0
+        next_tcp = started + 6.0
+        tcp_announced = False
+        sweep_announced = False
+        rejected = 0
+        while not stop_event.is_set():
+            now = time.time()
+            if now - last_query >= 2.0:       # широкомовний запит
+                last_query = now
+                for target in targets:
+                    try:
+                        sock.sendto(query, (target, discovery_port))
+                    except OSError:
+                        pass
+            # широкомовлення не дало відповіді — шукаємо перебором адрес
+            if sweep_hosts and now >= next_sweep:
+                next_sweep = now + 10.0
+                if not sweep_announced:
+                    sweep_announced = True
+                    print("Широкомовлення не дало відповіді — шукаю вчителя "
+                          "перебором адрес у підмережі…", file=sys.stderr)
+                for host in sweep_hosts:
+                    try:
+                        sock.sendto(query, (host, discovery_port))
+                    except OSError:
+                        pass
+            # UDP-відповіді не доходять (типово — вхідний UDP закрито фаєрволом) —
+            # шукаємо вчителя по TCP: вихідні TCP-з'єднання працюють завжди
+            if tcp_port and sweep_hosts and now >= next_tcp:
+                next_tcp = now + 10.0
+                if not tcp_announced:
+                    tcp_announced = True
+                    print("UDP-відповіді не надходять — пробую знайти вчителя "
+                          f"через TCP-порт {tcp_port}…", file=sys.stderr)
+                found_ip = find_teacher_tcp(token, tcp_port, sweep_hosts, stop_event)
+                if found_ip:
+                    return found_ip, tcp_port, found_ip
+            try:
+                data, addr = sock.recvfrom(2048)
+            except ConnectionResetError:         # Windows: ICMP від хоста без слухача
+                continue
+            except socket.timeout:
+                if now - last_hint > 15:
+                    last_hint = now
+                    hint = (f"Вчителя ще не знайдено ({int(now - started)} с). "
+                            f"Перевірте токен, мережу та UDP-порт {discovery_port} "
+                            f"у брандмауері.")
+                    if rejected:
+                        hint += (f" Отримано пакетів, які не пройшли перевірку: {rejected}.")
+                    print(hint, file=sys.stderr)
+                continue
+            ann = parse_announcement(token, data)
+            if ann:
+                return addr[0], ann["tcp_port"], ann["name"]
+            if parse_query(token, data):
+                continue                     # власний запит повернувся розсилкою
+            rejected += 1
+        return None
+    finally:
+        sock.close()
+
+
 # ---------- Взаємна автентифікація по TCP (токен по мережі не передається) ----------
 
 def server_handshake(conn, token):
-    """Повертає ім'я учня при успіху, інакше None."""
+    """Повертає (ім'я, роль) при успіху, інакше None. Роль за замовчуванням
+    ROLE_AGENT — старі агенти поля role не надсилають."""
     hello = json.loads(recv_packet(conn, 4096).decode("utf-8"))
     cnonce = str(hello["cnonce"])
     name = str(hello.get("name", ""))[:80]
+    role = str(hello.get("role", ROLE_AGENT))[:16] or ROLE_AGENT
     if not 8 <= len(cnonce) <= 64:
         raise ValueError("Bad client nonce")
     snonce = secrets.token_hex(16)
@@ -435,13 +689,14 @@ def server_handshake(conn, token):
     reply = json.loads(recv_packet(conn, 4096).decode("utf-8"))
     ok = hmac.compare_digest(str(reply.get("proof", "")), mac(token, "cli", snonce, cnonce))
     conn.sendall(b"OK" if ok else b"NO")
-    return name if ok else None
+    return (name, role) if ok else None
 
 
-def client_handshake(sock, token, name):
+def client_handshake(sock, token, name, role=ROLE_AGENT):
     """True, якщо вчитель підтвердив знання токена і прийняв нас."""
     cnonce = secrets.token_hex(16)
-    send_packet(sock, json.dumps({"name": name, "cnonce": cnonce}).encode("utf-8"))
+    send_packet(sock, json.dumps(
+        {"name": name, "role": role, "cnonce": cnonce}).encode("utf-8"))
     resp = json.loads(recv_packet(sock, 4096).decode("utf-8"))
     snonce = str(resp["snonce"])
     if not hmac.compare_digest(str(resp.get("proof", "")), mac(token, "srv", cnonce, snonce)):
@@ -921,12 +1176,14 @@ def new_mss():
     У mss >= 10.2 клас ``mss.mss`` оголошено застарілим (DeprecationWarning)
     на користь ``mss.MSS``. Повертаємо той варіант, який доступний.
     """
+    import mss
     factory = getattr(mss, "MSS", None) or getattr(mss, "mss", None)
     return factory()
 
 
 def capture_jpeg(sct, max_width=960, quality=55, monitor=0):
     """monitor=0 — об'єднаний робочий стіл, 1 — основний монітор."""
+    from PIL import Image
     monitors = sct.monitors
     shot = sct.grab(monitors[monitor if monitor < len(monitors) else 0])
     image = Image.frombytes("RGB", shot.size, shot.rgb)
