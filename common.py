@@ -735,6 +735,50 @@ def _which(tool):
     return None
 
 
+_BUNDLE_ENV_KEYS = ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONPATH")
+
+
+def _bundle_dirs():
+    """Теки, що належать збірці PyInstaller (виконуваний файл і вбудовані
+    бібліотеки). Повертає список приведених до реального шляху тек."""
+    dirs = []
+    for base in (app_dir(), bundle_dir(), getattr(sys, "_MEIPASS", None)):
+        if not base:
+            continue
+        try:
+            real = os.path.realpath(str(base))
+        except OSError:
+            continue
+        if real and real not in dirs:
+            dirs.append(real)
+    return dirs
+
+
+def _path_in_dirs(path, dirs):
+    """Чи вказує ``path`` на теку зі списку ``dirs`` (саму або всередині неї)."""
+    try:
+        real = os.path.realpath(str(path))
+    except OSError:
+        real = os.path.abspath(str(path))
+    for base in dirs:
+        if real == base or real.startswith(base + os.sep):
+            return True
+    return False
+
+
+def _strip_bundle_paths(value, dirs):
+    """Прибирає зі списку шляхів (через ``os.pathsep``) усі елементи, що
+    вказують у теки збірки. Порожні елементи теж відкидаються."""
+    kept = []
+    for entry in value.split(os.pathsep):
+        if not entry:
+            continue
+        if _path_in_dirs(entry, dirs):
+            continue
+        kept.append(entry)
+    return os.pathsep.join(kept)
+
+
 def clean_env(env=None):
     """Копія середовища без підмін PyInstaller — для запуску сторонніх програм.
 
@@ -742,18 +786,30 @@ def clean_env(env=None):
     ``LD_LIBRARY_PATH``. Якщо дочірній процес — системна утиліта (``systemctl``,
     ``shutdown``, ``poweroff``) або чужий застосунок, він підхоплює несумісні
     вбудовані бібліотеки і падає (напр. ``poweroff: version `OPENSSL_3.4.0'
-    not found``). Тому відновлюємо початкове значення (з ``*_ORIG``) або
-    прибираємо змінну. Гарантуємо базовий ``PATH``."""
+    not found``).
+
+    На відміну від відновлення зі ``*_ORIG`` (яке не працює, якщо змінна вже
+    містила теку збірки до старту — напр. її додав скрипт-обгортка), ми
+    **явно вирізаємо** з ``LD_LIBRARY_PATH``/``LD_PRELOAD``/``PYTHONPATH`` усі
+    елементи, що ведуть у теку виконуваного файла чи вбудованих бібліотек
+    (``sys._MEIPASS``). Системні утиліти завжди користуються системними
+    бібліотеками. Гарантуємо базовий ``PATH``."""
     env = dict(os.environ if env is None else env)
-    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONPATH"):
-        orig = env.get(key + "_ORIG")
-        if orig is not None:
-            if orig:
-                env[key] = orig
+    if is_frozen():
+        dirs = _bundle_dirs()
+        for key in _BUNDLE_ENV_KEYS:
+            value = env.get(key)
+            if not value:
+                continue
+            cleaned = _strip_bundle_paths(value, dirs)
+            if cleaned:
+                env[key] = cleaned
             else:
                 env.pop(key, None)
-        elif is_frozen():
-            env.pop(key, None)
+        home = env.get("PYTHONHOME")
+        if home and _path_in_dirs(home, dirs):
+            env.pop("PYTHONHOME", None)
+        env.pop("LD_LIBRARY_PATH_ORIG", None)
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")
     return env
 
