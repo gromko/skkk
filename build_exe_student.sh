@@ -7,7 +7,6 @@
 # Результат — окрема тека dist/student/:
 #   student_agent, skkk_student_setup, netguard   — виконувані файли
 #   shared_libs/                                  — спільні залежності (одна копія)
-#   netguard.sh, netguard.ps1                     — обгортки запуску/автозапуску netguard
 #   icon.png                                      — іконка застосунків
 #
 # Кожен виконуваний файл шукає бібліотеки в теці shared_libs/ поряд із собою
@@ -94,15 +93,14 @@ for app in "${APPS[@]}"; do
     mv "$OUT/.${app}_tmp" "$OUT/$app"
 done
 
-# Обгортки netguard (використовують зібраний netguard, якщо він поряд).
-cp netguard.sh netguard.ps1 "$OUT/"
+# Іконка застосунків.
 cp icon.png "$OUT/"
-chmod +x "$OUT/netguard.sh" "$OUT/student_agent" "$OUT/skkk_student_setup" "$OUT/netguard"
+chmod +x "$OUT/student_agent" "$OUT/skkk_student_setup" "$OUT/netguard"
 
 echo
 echo "Готово. Тека dist/student/ містить:"
 echo "  student_agent, skkk_student_setup, netguard   — виконувані файли"
 echo "  shared_libs/                                  — спільні бібліотеки (одна копія)"
-echo "  netguard.sh, netguard.ps1, icon.png           — обгортки та іконка"
+echo "  icon.png                                      — іконка"
 echo
 echo "Розповсюджуйте всю теку dist/student/ цілком."

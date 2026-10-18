@@ -1566,14 +1566,14 @@ SETUP_SCRIPT = program_path("skkk_student_setup")
 
 
 def _has_display():
-    """Чи є графічна сесія (потрібна для вікна майстра налаштування)."""
+    """Чи є графічна сесія (потрібна для вікна меню налаштування)."""
     if sys.platform == "win32":
         return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def _student_setup_needed(args):
-    """Чи потрібно перед стартом запустити майстер налаштування учня."""
+    """Чи потрібно перед стартом запустити меню налаштування учня."""
     if args.token or args.token_file:
         return False
     token = load_token()
@@ -1583,18 +1583,18 @@ def _student_setup_needed(args):
 
 
 def _run_student_setup():
-    """Запускає майстер налаштування учня (skkk_student_setup) і чекає на
+    """Запускає меню налаштування учня (skkk_student_setup) і чекає на
     завершення. Для зібраного застосунку — сусідній виконуваний файл, для
     вихідного коду — skkk_student_setup.py."""
     if not SETUP_SCRIPT.exists():
-        print(f"Не знайдено майстер налаштування: {SETUP_SCRIPT}", file=sys.stderr)
+        print(f"Не знайдено меню налаштування: {SETUP_SCRIPT}", file=sys.stderr)
         return
-    print("Середовище ще не налаштоване — запускаю майстер налаштування…")
+    print("Середовище ще не налаштоване — запускаю меню налаштування…")
     try:
         subprocess.run(program_command("skkk_student_setup", "--no-launch"),
                        cwd=str(app_dir()), check=False)
     except OSError as exc:
-        print(f"Не вдалося запустити майстер налаштування: {exc}", file=sys.stderr)
+        print(f"Не вдалося запустити меню налаштування: {exc}", file=sys.stderr)
 
 
 def _set_window_icon(root):

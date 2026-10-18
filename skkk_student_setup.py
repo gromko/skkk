@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""SKKK — перевірка та автоматичне налаштування учнівського комп'ютера.
+"""SKKK — меню налаштування учнівського комп'ютера.
 
-Графічний майстер для комп'ютера учня, який:
-  * перевіряє наявність потрібних бібліотек (tkinter, Pillow, ImageTk, mss);
-  * перевіряє доступність локальної мережі та вмикає синхронізацію часу;
-  * відкриває у фаєрволі вхідний UDP-порт виявлення (щоб отримувати
-    оголошення вчителя);
-  * допомагає отримати токен доступу — імпортує `classroom_token.txt`,
-    скопійований з комп'ютера вчителя (новий токен тут НЕ створюється, бо він
-    має збігатися з токеном учителя);
-  * за потреби створює `classroom_config.json`;
-  * **за дозволом користувача** додає агента учня (student_agent.py) та
+Графічне меню з п'ятьма діями для комп'ютера учня:
+  * «Налаштування системи» — перевіряє/встановлює потрібні компоненти
+    (tkinter, Pillow, ImageTk, mss), перевіряє локальну мережу, вмикає
+    синхронізацію часу, відкриває вхідний UDP-порт у фаєрволі, дозволяє
+    вимкнення по мережі (polkit), імпортує токен доступу з комп'ютера
+    вчителя та створює файл налаштувань;
+  * «Додати в Автозавантаження» — додає агента учня (student_agent) та
     привілейований netguard до автозавантаження при вході в систему;
-  * показує журнал дій: успішні кроки — зелена галочка, невдалі — червоний знак;
-  * у кінці пропонує запустити student_agent.py.
+  * «Видалити з Автозавантаження» — прибирає обидва з автозавантаження;
+  * «Запустити систему» — запускає netguard з правами адміністратора та
+    агента учня, якщо вони ще не працюють;
+  * «Перевірити параметри» — показує стан токена, налаштувань, мережі,
+    синхронізації часу, фаєрвола, автозавантаження та процесів.
 
-student_agent.py викликає цей майстер, якщо учнівський комп'ютер ще не
+student_agent.py викликає це меню, якщо учнівський комп'ютер ще не
 налаштований.
 """
 import json
@@ -33,10 +33,8 @@ import common  # легкий модуль без залежностей від 
 
 BASE_DIR = common.app_dir()
 CONFIG_FILE = BASE_DIR / "classroom_config.json"
-AGENT_SCRIPT = common.program_path("student_agent")
-NETGUARD_SCRIPT = common.program_path("netguard")
-NETGUARD_SH = BASE_DIR / "netguard.sh"
-NETGUARD_PS1 = BASE_DIR / "netguard.ps1"
+AGENT_NAME = "student_agent"
+NETGUARD_NAME = "netguard"
 
 try:
     import tkinter as tk
@@ -48,7 +46,7 @@ except Exception:                      # tkinter відсутній
     HAVE_TK = False
 
 
-# --- Кольори/іконки інтерфейсу ---
+# --- Кольори інтерфейсу ---
 BG = "#f4f6fa"
 SURFACE = "#ffffff"
 BORDER = "#d8dee8"
@@ -59,12 +57,6 @@ GREEN = "#059669"
 RED = "#dc2626"
 ORANGE = "#d97706"
 
-ICONS = {"pending": "•", "running": "…", "ok": "\u2714", "fail": "\u2718",
-         "warn": "!", "skip": "–"}
-ICON_COLORS = {"pending": MUTED, "running": ACCENT, "ok": GREEN, "fail": RED,
-               "warn": ORANGE, "skip": MUTED}
-TERMINAL = ("ok", "fail", "warn", "skip")
-
 # Залежності: (id, модуль для import, пакети apt, пакети pip)
 LIBS = [
     ("tkinter", "tkinter", ["python3-tk"], []),
@@ -73,29 +65,36 @@ LIBS = [
     ("mss", "mss", ["python3-mss"], ["mss"]),
 ]
 
-STEPS = [
-    ("python", "Версія Python (3.10+)"),
-    ("tkinter", "Модуль tkinter"),
-    ("pillow", "Бібліотека Pillow (PIL)"),
-    ("imagetk", "Підтримка ImageTk"),
-    ("mss", "Бібліотека mss"),
-    ("network", "Локальна мережа"),
-    ("timesync", "Синхронізація часу"),
-    ("firewall", "Дозвіл оголошень (UDP)"),
-    ("token", "Токен доступу (з учителя)"),
-    ("config", "Файл налаштувань"),
-    ("autostart_agent", "Автозавантаження агента учня"),
-    ("autostart_netguard", "Автозавантаження netguard"),
-]
-
 # Без чого агент не працює повноцінно. tkinter/ImageTk лише вмикають показ
 # демонстрації та блокування — про їх відсутність попереджаємо, але не робимо
 # критичними.
-CRITICAL = {"python", "pillow", "mss", "token"}
+CRITICAL = {"pillow", "mss", "token"}
 
 AGENT_AUTOSTART_BASENAME = "student_agent.desktop"
 AGENT_WIN_BAT = "skkk_student_agent.bat"
 NETGUARD_TASK_NAME = "ClassroomNetguard"
+NETGUARD_DESKTOP = "netguard.desktop"
+NETGUARD_CRON_LOG = "/var/log/netguard.log"
+
+# polkit-правило, яке дозволяє локальному користувачу вимикати комп'ютер
+# без пароля — потрібне, щоб агент учня виконав команду вчителя «вимкнути».
+POLKIT_RULES_PATH = Path("/etc/polkit-1/rules.d/49-classroom-poweroff.rules")
+POLKIT_RULES_DIR = POLKIT_RULES_PATH.parent
+POLKIT_RULE_CONTENT = (
+    "// SKKK: дозволяє локальному користувачу вимикати комп'ютер\n"
+    "// за командою вчителя без запиту пароля (агент учня, polkit/logind).\n"
+    "polkit.addRule(function(action, subject) {\n"
+    "    if ((action.id == \"org.freedesktop.login1.power-off\" ||\n"
+    "         action.id == \"org.freedesktop.login1.power-off-multiple-sessions\" ||\n"
+    "         action.id == \"org.freedesktop.login1.power-off-ignore-inhibit\") &&\n"
+    "        subject.local) {\n"
+    "        return polkit.Result.YES;\n"
+    "    }\n"
+    "});\n"
+)
+
+STATE_DIR = Path.home() / ".config" / "classroom_screen_monitor"
+NETGUARD_AUTOSTART_MARKER = STATE_DIR / "netguard_autostart.json"
 
 
 def module_available(name):
@@ -129,15 +128,26 @@ def windows_pythonw():
     return str(candidate if candidate.exists() else exe)
 
 
+def _ps_quote(value):
+    """Обгортає рядок у лапки PowerShell (одинарні лапки подвоюються)."""
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _ps_encoded(script):
+    """Кодує PowerShell-скрипт у base64 (UTF-16LE) для -EncodedCommand.
+
+    Так уникаємо проблем із вкладеними лапками під час передавання команди
+    через cmd.exe із підвищенням прав (UAC)."""
+    import base64
+    return base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+
+
 class SetupApp:
     def __init__(self, root):
         self.root = root
         self.q = queue.Queue()
-        self.rows = {}
-        self.completed = 0
-        self.total = len(STEPS)
-        self.running = False
-        self.no_launch = False
+        self.busy = False
+        self.buttons = []
         self.family = tkfont.nametofont("TkDefaultFont").actual("family")
         cfg = common.load_config()
         self.tcp_port = int(cfg["tcp_port"])
@@ -147,52 +157,42 @@ class SetupApp:
     def build(self):
         self.root.title("SKKK — налаштування учнівського комп'ютера")
         self.root.configure(bg=BG)
-        self.root.geometry("800x700")
-        self.root.minsize(680, 580)
+        self.root.geometry("780x620")
+        self.root.minsize(660, 520)
 
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill="x", padx=16, pady=(14, 6))
         tk.Label(header, text="Налаштування учнівського комп'ютера", bg=BG, fg=TEXT,
                  font=(self.family, 16, "bold")).pack(anchor="w")
-        tk.Label(header, text="Перевірка бібліотек і мережі, токен доступу, "
-                              "синхронізація часу, фаєрвол та автозавантаження.",
+        tk.Label(header, text="Виберіть дію. Перебіг виконання видно в журналі "
+                              "внизу вікна.",
                  bg=BG, fg=MUTED, font=(self.family, 10)).pack(anchor="w")
 
-        steps_wrap = tk.Frame(self.root, bg=SURFACE, highlightthickness=1,
-                              highlightbackground=BORDER)
-        steps_wrap.pack(fill="both", expand=True, padx=16, pady=(6, 8))
-        canvas = tk.Canvas(steps_wrap, bg=SURFACE, highlightthickness=0)
-        scroll = ttk.Scrollbar(steps_wrap, orient="vertical", command=canvas.yview)
-        inner = tk.Frame(canvas, bg=SURFACE)
-        inner.bind("<Configure>",
-                   lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=scroll.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
-
-        for sid, title in STEPS:
-            row = tk.Frame(inner, bg=SURFACE)
-            row.pack(fill="x", padx=10, pady=2)
-            icon = tk.Label(row, text=ICONS["pending"], bg=SURFACE,
-                            fg=ICON_COLORS["pending"], width=2,
-                            font=(self.family, 13, "bold"))
-            icon.pack(side="left")
-            name = tk.Label(row, text=title, bg=SURFACE, fg=TEXT,
-                            font=(self.family, 10, "bold"), anchor="w", width=30)
-            name.pack(side="left")
-            detail = tk.Label(row, text="", bg=SURFACE, fg=MUTED,
-                              font=(self.family, 9), anchor="w", justify="left",
-                              wraplength=380)
-            detail.pack(side="left", fill="x", expand=True)
-            self.rows[sid] = (icon, detail)
+        menu = tk.Frame(self.root, bg=BG)
+        menu.pack(fill="x", padx=16, pady=(4, 8))
+        self._menu_button(menu, "Налаштування системи",
+                          "автоматичне налаштування: компоненти, мережа, "
+                          "файрвол, токен",
+                          self.on_setup)
+        self._menu_button(menu, "Додати в Автозавантаження",
+                          "netguard і агент учня запускатимуться при вході в систему",
+                          self.on_autostart_add)
+        self._menu_button(menu, "Видалити з Автозавантаження",
+                          "прибрати netguard і агента учня з автозавантаження",
+                          self.on_autostart_remove)
+        self._menu_button(menu, "Запустити систему",
+                          "netguard з правами адміністратора та агент учня",
+                          self.on_launch)
+        self._menu_button(menu, "Перевірити параметри",
+                          "стан токена, налаштувань, файрвола, автозавантаження",
+                          self.on_check)
 
         tk.Label(self.root, text="Журнал:", bg=BG, fg=TEXT,
                  font=(self.family, 10, "bold")).pack(anchor="w", padx=16)
         log_wrap = tk.Frame(self.root, bg=SURFACE, highlightthickness=1,
                             highlightbackground=BORDER)
-        log_wrap.pack(fill="both", expand=False, padx=16, pady=(2, 8))
-        self.log_text = tk.Text(log_wrap, height=9, bg=SURFACE, fg=TEXT,
+        log_wrap.pack(fill="both", expand=True, padx=16, pady=(2, 8))
+        self.log_text = tk.Text(log_wrap, height=12, bg=SURFACE, fg=TEXT,
                                 relief="flat", wrap="word", font=(self.family, 9))
         log_scroll = ttk.Scrollbar(log_wrap, orient="vertical",
                                    command=self.log_text.yview)
@@ -202,27 +202,21 @@ class SetupApp:
 
         bottom = tk.Frame(self.root, bg=BG)
         bottom.pack(fill="x", padx=16, pady=(0, 14))
-        self.progress = ttk.Progressbar(bottom, mode="determinate",
-                                        maximum=self.total)
-        self.progress.pack(fill="x", pady=(0, 8))
-        btns = tk.Frame(bottom, bg=BG)
-        btns.pack(fill="x")
-        self.start_btn = ttk.Button(btns, text="Перевірити та налаштувати",
-                                    command=self.start)
-        self.start_btn.pack(side="left")
-        ttk.Button(btns, text="Закрити", command=self.root.destroy).pack(side="right")
+        ttk.Button(bottom, text="Закрити", command=self.root.destroy).pack(side="right")
 
-        self.root.after(300, self.start)      # автозапуск майстра
+        self.root.after(200, self.poll)
 
-    # ---------- потік виконання ----------
-    def start(self):
-        if self.running:
-            return
-        self.running = True
-        self.start_btn.configure(state="disabled")
-        threading.Thread(target=self.worker, daemon=True).start()
-        self.poll()
+    def _menu_button(self, parent, text, desc, command):
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=3)
+        button = ttk.Button(row, text=text, command=command, width=30)
+        button.pack(side="left")
+        tk.Label(row, text=desc, bg=BG, fg=MUTED, font=(self.family, 9),
+                 anchor="w", justify="left", wraplength=380).pack(
+                     side="left", padx=(12, 0))
+        self.buttons.append(button)
 
+    # ---------- черга повідомлень ----------
     def poll(self):
         try:
             while True:
@@ -233,41 +227,76 @@ class SetupApp:
 
     def handle(self, msg):
         kind = msg[0]
-        if kind == "step":
-            status = msg[2]
-            self.set_step(*msg[1:])
-            if status in TERMINAL:
-                self.completed += 1
-                self.progress.configure(value=self.completed)
-        elif kind == "log":
+        if kind == "log":
             self._append_log(msg[1])
         elif kind == "ask":
             _, ask_kind, kwargs, holder, event = msg
             self._handle_ask(ask_kind, kwargs, holder, event)
         elif kind == "done":
-            self.on_done(msg[1])
+            _, ok, title, message = msg
+            self.busy = False
+            self._set_buttons("normal")
+            if ok:
+                messagebox.showinfo(title, message, parent=self.root)
+            else:
+                messagebox.showwarning(title, message, parent=self.root)
 
-    def set_step(self, sid, status, detail=""):
-        icon, lbl = self.rows[sid]
-        icon.configure(text=ICONS.get(status, "•"),
-                       fg=ICON_COLORS.get(status, MUTED))
-        if detail:
-            color = {"ok": GREEN, "fail": RED, "warn": ORANGE}.get(status, MUTED)
-            lbl.configure(text=detail, fg=color)
-
-    def step(self, sid, status, detail=""):
-        """Надсилає оновлення кроку з робочого потоку до GUI (через чергу)."""
-        self.q.put(("step", sid, status, detail))
-
+    # ---------- журнал ----------
     def log(self, text):
         """Надсилає рядок журналу з робочого потоку до GUI (через чергу)."""
         self.q.put(("log", text))
+
+    def log_ok(self, text):
+        self.log("\u2714 " + text)
+
+    def log_fail(self, text):
+        self.log("\u2718 " + text)
+
+    def log_warn(self, text):
+        self.log("! " + text)
 
     def _append_log(self, text):
         self.log_text.configure(state="normal")
         self.log_text.insert("end", text.rstrip() + "\n")
         self.log_text.see("end")
         self.log_text.configure(state="disabled")
+
+    # ---------- запуск завдань як кнопок ----------
+    def _set_buttons(self, state):
+        for button in self.buttons:
+            button.configure(state=state)
+
+    def _start_task(self, func, title):
+        if self.busy:
+            return
+        self.busy = True
+        self._set_buttons("disabled")
+        self.log("")
+        self.log(f"=== {title} ===")
+        threading.Thread(target=self._run_task, args=(func, title),
+                         daemon=True).start()
+
+    def _run_task(self, func, title):
+        try:
+            ok, message = func()
+        except Exception as exc:                      # noqa: BLE001
+            ok, message = False, f"Помилка: {exc}"
+        self.q.put(("done", bool(ok), title, message))
+
+    def on_setup(self):
+        self._start_task(self.task_setup, "Налаштування системи")
+
+    def on_autostart_add(self):
+        self._start_task(self.task_autostart_add, "Додати в Автозавантаження")
+
+    def on_autostart_remove(self):
+        self._start_task(self.task_autostart_remove, "Видалити з Автозавантаження")
+
+    def on_launch(self):
+        self._start_task(self.task_launch, "Запустити систему")
+
+    def on_check(self):
+        self._start_task(self.task_check, "Перевірити параметри")
 
     # ---------- запити до користувача (з робочого потоку) ----------
     def _ask(self, kind, **kwargs):
@@ -381,7 +410,7 @@ class SetupApp:
             try:
                 code = ctypes.windll.shell32.ShellExecuteW(
                     None, "runas", "cmd.exe", f"/c {script}", None, 0)
-            except Exception as exc:
+            except Exception as exc:                  # noqa: BLE001
                 self.log(f"Запит UAC не вдався: {exc}")
                 return None
             _Win.returncode = 0 if code > 32 else 1
@@ -412,6 +441,16 @@ class SetupApp:
             return self.run_plain([pkexec, "sh", "-c", script])
         self.log("Не знайдено sudo або pkexec — підвищення прав неможливе.")
         return None
+
+    def _log_result(self, result):
+        if result is None:
+            return
+        out = (result.stdout or "").strip()
+        err = (result.stderr or "").strip()
+        if out:
+            self.log(out)
+        if err:
+            self.log(err)
 
     # ---------- встановлення залежностей ----------
     def install_python_pkg(self, package):
@@ -447,15 +486,7 @@ class SetupApp:
                     ok = True
         return ok
 
-    # ---------- окремі кроки ----------
-    def check_network(self):
-        ok, detail, _ips = test_broadcast()
-        if ok:
-            self.step("network", "ok", detail)
-        else:
-            self.step("network", "fail", detail)
-        return ok
-
+    # ---------- окремі кроки налаштування ----------
     def setup_timesync(self):
         system = platform.system()
         if system == "Windows":
@@ -463,46 +494,47 @@ class SetupApp:
                 result = common.ensure_time_sync(on_elevate=self.log)
             except Exception as exc:                  # noqa: BLE001
                 self.log(f"Синхронізація часу: {exc}")
-                self.step("timesync", "warn", "не вдалося налаштувати")
+                self.log_warn("Синхронізація часу: не вдалося налаштувати")
                 return False
             status = result.get("status")
-            self.log(result.get("message", ""))
-            self.step("timesync", "ok" if status in ("ok", "added") else "warn",
-                      result.get("message", ""))
-            return status in ("ok", "added")
+            if result.get("message"):
+                self.log(result["message"])
+            if status in ("ok", "added"):
+                self.log_ok("Синхронізацію часу увімкнено")
+                return True
+            self.log_warn(f"Синхронізація часу: {result.get('message', 'невідомо')}")
+            return False
         if system != "Linux":
-            self.step("timesync", "skip", "не підтримується на цій системі")
+            self.log("Синхронізація часу не підтримується на цій системі")
             return False
         try:
             if common._ts_linux_synced() is True:     # noqa: SLF001
-                self.step("timesync", "ok", "синхронізація часу вже активна")
+                self.log_ok("Синхронізація часу вже активна")
                 return True
             mode, command = common._ts_linux_plan()   # noqa: SLF001
             if mode is None:
-                self.step("timesync", "warn", "не знайдено служби синхронізації часу")
+                self.log_warn("Не знайдено служби синхронізації часу")
                 return False
             result = self.run_privileged(
                 command, "Увімкнення автоматичної синхронізації часу (NTP).")
             if result is not None and result.returncode == 0:
                 common._ts_record_marker(mode)        # noqa: SLF001
-                self.step("timesync", "ok", f"синхронізацію часу увімкнено ({mode})")
+                self.log_ok(f"Синхронізацію часу увімкнено ({mode})")
                 return True
-            self.step("timesync", "warn", "не вдалося увімкнути синхронізацію часу")
+            self.log_warn("Не вдалося увімкнути синхронізацію часу")
             return False
         except Exception as exc:                      # noqa: BLE001
-            self.step("timesync", "warn", f"помилка: {exc}")
+            self.log_warn(f"Синхронізація часу: помилка: {exc}")
             return False
 
     def setup_firewall(self):
         """Відкриває вхідний UDP-порт виявлення, щоб учень отримував оголошення
         та відповіді вчителя. Помилки не критичні для роботи агента."""
-        ok = self._fw_port(self.udp_port, "udp")
-        if ok:
-            self.step("firewall", "ok", f"вхідний UDP-порт {self.udp_port} дозволено")
-        else:
-            self.step("firewall", "warn",
-                      f"не вдалося відкрити UDP-порт {self.udp_port} — див. журнал")
-        return ok
+        if self._fw_port(self.udp_port, "udp"):
+            self.log_ok(f"Вхідний UDP-порт {self.udp_port} дозволено у фаєрволі")
+            return True
+        self.log_warn(f"Не вдалося відкрити UDP-порт {self.udp_port} — див. журнал")
+        return False
 
     def _fw_port(self, port, proto):
         system = platform.system()
@@ -513,7 +545,8 @@ class SetupApp:
             except Exception as exc:                  # noqa: BLE001
                 self.log(f"Фаєрвол: {exc}")
                 return False
-            self.log(result.get("message", ""))
+            if result.get("message"):
+                self.log(result["message"])
             return result.get("status") in ("ok", "added")
         if system != "Linux":
             return False
@@ -536,13 +569,50 @@ class SetupApp:
             self.log((result.stderr or "").strip())
         return False
 
+    @staticmethod
+    def power_permission_present():
+        """Чи встановлено polkit-правило для вимкнення по мережі."""
+        try:
+            return "login1.power-off" in POLKIT_RULES_PATH.read_text(encoding="utf-8")
+        except OSError:
+            return False
+
+    def setup_power_permission(self):
+        """Дозволяє локальному користувачу вимикати комп'ютер без пароля, щоб
+        агент учня (не root) виконав команду вчителя «вимкнути» через
+        logind/systemctl. Помилки не критичні для роботи агента."""
+        if platform.system() != "Linux":
+            return False
+        if self.power_permission_present():
+            self.log_ok("Дозвіл на вимкнення по мережі вже встановлено")
+            return True
+        if not POLKIT_RULES_DIR.is_dir() and not common._which("pkcheck"):  # noqa: SLF001
+            self.log_warn("polkit не знайдено — вимкнення по мережі може не працювати")
+            return False
+        script = (
+            f"install -d -m 0755 {shlex.quote(str(POLKIT_RULES_DIR))} && "
+            f"cat > {shlex.quote(str(POLKIT_RULES_PATH))} <<'SKKK_POLKIT_EOF'\n"
+            + POLKIT_RULE_CONTENT +
+            "SKKK_POLKIT_EOF\n"
+            f"chmod 0644 {shlex.quote(str(POLKIT_RULES_PATH))}"
+        )
+        result = self.run_privileged(
+            script, "Для дозволу вимкнення по мережі потрібні права root.")
+        if result is not None and result.returncode == 0 \
+                and self.power_permission_present():
+            self.log_ok("Дозвіл на вимкнення по мережі встановлено")
+            return True
+        if result is not None and (result.stderr or "").strip():
+            self.log((result.stderr or "").strip())
+        self.log_warn("Не вдалося встановити дозвіл на вимкнення по мережі")
+        return False
+
     def setup_token(self):
         """Токен учня має збігатися з токеном учителя, тому тут він не
         генерується, а імпортується з готового файлу."""
         token = common.load_token()
         if token and len(token) >= common.MIN_TOKEN_LEN:
-            self.step("token", "ok",
-                      f"токен знайдено ({common.token_file_path()})")
+            self.log_ok(f"Токен знайдено ({common.token_file_path()})")
             return True
         self.log("Токен доступу не знайдено або він закороткий.")
         self.log(f"Очікується файл: {common.token_file_path()}")
@@ -554,15 +624,15 @@ class SetupApp:
             "Вибрати файл «classroom_token.txt», скопійований з комп'ютера "
             "вчителя?")
         if not proceed:
-            self.step("token", "fail",
-                      "токен не знайдено — скопіюйте classroom_token.txt з учителя")
+            self.log_fail("Токен не знайдено — скопіюйте classroom_token.txt "
+                          "з комп'ютера вчителя")
             return False
         path = self.ask_open_file(
             "Виберіть файл classroom_token.txt з комп'ютера вчителя",
             filetypes=[("Текст", "*.txt"), ("Усі файли", "*.*")],
             initialdir=str(Path.home() / "Downloads"))
         if not path:
-            self.step("token", "fail", "файл токена не вибрано")
+            self.log_fail("Файл токена не вибрано")
             return False
         try:
             candidate = ""
@@ -572,20 +642,19 @@ class SetupApp:
                         candidate = line.strip()
                         break
             if len(candidate) < common.MIN_TOKEN_LEN:
-                self.step("token", "fail",
-                          "у вибраному файлі немає коректного токена")
+                self.log_fail("У вибраному файлі немає коректного токена")
                 return False
             dest = common.save_token(candidate)
         except OSError as exc:
-            self.step("token", "fail", f"не вдалося зберегти токен: {exc}")
+            self.log_fail(f"Не вдалося зберегти токен: {exc}")
             return False
-        self.step("token", "ok", "токен імпортовано з файлу вчителя")
+        self.log_ok("Токен імпортовано з файлу вчителя")
         self.log(f"Токен збережено у файлі {dest}.")
         return True
 
     def setup_config(self):
         if CONFIG_FILE.exists():
-            self.step("config", "ok", f"{CONFIG_FILE.name} уже існує")
+            self.log_ok(f"{CONFIG_FILE.name} уже існує")
             return True
         data = {}
         try:
@@ -599,15 +668,15 @@ class SetupApp:
             with open(CONFIG_FILE, "w", encoding="utf-8") as handle:
                 json.dump(data, handle, ensure_ascii=False, indent=2)
         except OSError as exc:
-            self.step("config", "warn", f"не вдалося створити файл: {exc}")
+            self.log_warn(f"Не вдалося створити файл налаштувань: {exc}")
             return False
         detail = f"створено {CONFIG_FILE.name}"
         if data.get("broadcast_address"):
             detail += f" (broadcast {data['broadcast_address']})"
-        self.step("config", "ok", detail)
+        self.log_ok(detail)
         return True
 
-    # ---------- автозавантаження ----------
+    # ---------- автозавантаження агента учня ----------
     def _agent_desktop_path(self):
         return Path.home() / ".config" / "autostart" / AGENT_AUTOSTART_BASENAME
 
@@ -641,12 +710,53 @@ class SetupApp:
         self.log("Автозавантаження агента не підтримується на цій системі.")
         return False
 
+    def remove_agent_autostart(self):
+        system = platform.system()
+        removed = False
+        if system == "Windows":
+            bat = self._win_startup_dir() / AGENT_WIN_BAT
+            if bat.exists():
+                try:
+                    bat.unlink()
+                    removed = True
+                    self.log(f"Видалено {bat}.")
+                except OSError as exc:
+                    self.log_fail(f"Не вдалося видалити {bat}: {exc}")
+                    return False
+        elif system == "Linux":
+            desktop = self._agent_desktop_path()
+            if desktop.exists():
+                try:
+                    desktop.unlink()
+                    removed = True
+                    self.log(f"Видалено {desktop}.")
+                except OSError as exc:
+                    self.log_fail(f"Не вдалося видалити {desktop}: {exc}")
+                    return False
+            startup = Path.home() / ".desktop-session" / "startup"
+            if startup.exists():
+                try:
+                    lines = startup.read_text(encoding="utf-8").splitlines()
+                    kept = [ln for ln in lines
+                            if "student_agent" not in ln
+                            and "автозапуск агента учня" not in ln]
+                    if len(kept) != len(lines):
+                        startup.write_text("\n".join(kept) + "\n", encoding="utf-8")
+                        removed = True
+                        self.log(f"Очищено {startup}.")
+                except OSError as exc:
+                    self.log_fail(f"Не вдалося оновити {startup}: {exc}")
+                    return False
+        if not removed:
+            self.log("Автозавантаження агента не знайдено.")
+        return True
+
     def _agent_command_string(self):
         """Команда запуску агента (для .desktop/startup/.bat). У зібраному
         застосунку — сусідній student_agent, для вихідного коду — python
         student_agent.py."""
         return " ".join(shlex.quote(str(part))
-                        for part in common.program_command("student_agent"))
+                        for part in common.program_command(AGENT_NAME))
 
     def _install_agent_linux(self):
         base = str(BASE_DIR)
@@ -703,9 +813,9 @@ class SetupApp:
             startup.mkdir(parents=True, exist_ok=True)
             bat = startup / AGENT_WIN_BAT
             if common.is_frozen():
-                cmd = common.program_command("student_agent")
+                cmd = common.program_command(AGENT_NAME)
             else:
-                cmd = [windows_pythonw(), str(AGENT_SCRIPT)]
+                cmd = [windows_pythonw(), str(common.program_path(AGENT_NAME))]
             args = " ".join(f'"{part}"' for part in cmd)
             content = ("@echo off\r\n"
                        f'cd /d "{BASE_DIR}"\r\n'
@@ -717,7 +827,10 @@ class SetupApp:
         self.log(f"Автозавантаження агента: {bat}")
         return True
 
+    # ---------- автозавантаження netguard ----------
     def netguard_autostart_installed(self):
+        if NETGUARD_AUTOSTART_MARKER.exists():
+            return True
         system = platform.system()
         if system == "Windows":
             result = self.run_plain(["schtasks", "/query", "/tn", NETGUARD_TASK_NAME],
@@ -728,7 +841,7 @@ class SetupApp:
             if result is not None and result.returncode == 0 \
                     and "netguard" in (result.stdout or ""):
                 return True
-            autostart = Path.home() / ".config" / "autostart" / "netguard.desktop"
+            autostart = Path.home() / ".config" / "autostart" / NETGUARD_DESKTOP
             if autostart.exists():
                 return True
             try:
@@ -740,178 +853,439 @@ class SetupApp:
                 pass
         return False
 
+    def _record_netguard_autostart(self):
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            NETGUARD_AUTOSTART_MARKER.write_text(
+                json.dumps({"installed": True, "platform": platform.platform()},
+                           ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _clear_netguard_marker(self):
+        try:
+            NETGUARD_AUTOSTART_MARKER.unlink()
+        except OSError:
+            pass
+
     def install_netguard_autostart(self):
         system = platform.system()
         if system == "Windows":
-            if not NETGUARD_PS1.exists():
-                self.log(f"Не знайдено {NETGUARD_PS1}")
-                return False
-            command = (f'powershell -NoProfile -ExecutionPolicy Bypass '
-                       f'-File "{NETGUARD_PS1}" Install')
-            result = self.run_privileged(
-                command,
-                "Для автозапуску netguard (заплановане завдання з правами "
-                "адміністратора) потрібні права адміністратора.")
+            ok = self._install_netguard_windows()
         elif system == "Linux":
-            if not NETGUARD_SH.exists():
-                self.log(f"Не знайдено {NETGUARD_SH}")
-                return False
-            command = f"sh {shlex.quote(str(NETGUARD_SH))} install"
-            result = self.run_privileged(
-                command,
-                "Для автозапуску netguard з правами root (керування фаєрволом) "
-                "потрібні права адміністратора.")
+            ok = self._install_netguard_linux()
         else:
             self.log("Автозавантаження netguard не підтримується на цій системі.")
             return False
-        if result is not None:
-            if (result.stdout or "").strip():
-                self.log((result.stdout or "").strip())
-            if (result.stderr or "").strip():
-                self.log((result.stderr or "").strip())
+        if ok:
+            self._record_netguard_autostart()
+        return ok
+
+    def _install_netguard_linux(self):
+        run_cmd = " ".join(shlex.quote(str(part))
+                           for part in common.program_command(NETGUARD_NAME))
+        line = (f"@reboot cd {shlex.quote(str(BASE_DIR))} && {run_cmd} "
+                f">> {NETGUARD_CRON_LOG} 2>&1")
+        script = (
+            'tmp="$(mktemp)"\n'
+            '{ crontab -l 2>/dev/null | grep -v netguard || true; } > "$tmp"\n'
+            f"printf '%s\\n' {shlex.quote(line)} >> \"$tmp\"\n"
+            'crontab "$tmp"\n'
+            'rm -f "$tmp"\n'
+        )
+        result = self.run_privileged(
+            script,
+            "Для автозапуску netguard з правами root (керування фаєрволом) "
+            "потрібні права адміністратора.")
+        self._log_result(result)
         return result is not None and result.returncode == 0
 
-    def setup_autostart_agent(self):
-        if self.agent_autostart_installed():
-            self.step("autostart_agent", "ok", "уже ввімкнено")
-            return True
-        allowed = self.ask_yesno(
-            "Автозавантаження агента учня",
-            "Додати агента учня до автозавантаження, щоб він "
-            "запускався автоматично при вході в систему?\n\n"
-            "Це потрібно, щоб комп'ютер учня завжди був доступний учителю.")
-        if not allowed:
-            self.step("autostart_agent", "skip",
-                      "пропущено на прохання користувача")
-            return False
-        if self.install_agent_autostart():
-            self.step("autostart_agent", "ok", "автозавантаження додано")
-            return True
-        self.step("autostart_agent", "fail", "не вдалося додати автозавантаження")
-        return False
+    def _install_netguard_windows(self):
+        run = common.program_command(NETGUARD_NAME)
+        exe = str(run[0])
+        args = " ".join(f'"{part}"' for part in run[1:])
+        ps = (
+            f"$a = New-ScheduledTaskAction -Execute {_ps_quote(exe)} "
+            f"-Argument {_ps_quote(args)} -WorkingDirectory {_ps_quote(str(BASE_DIR))}; "
+            "$t = New-ScheduledTaskTrigger -AtLogOn; "
+            "$p = New-ScheduledTaskPrincipal -UserId 'SYSTEM' "
+            "-LogonType ServiceAccount -RunLevel Highest; "
+            "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries "
+            "-DontStopIfGoingOnBatteries -StartWhenAvailable "
+            "-ExecutionTimeLimit ([TimeSpan]::Zero); "
+            f"Unregister-ScheduledTask -TaskName {_ps_quote(NETGUARD_TASK_NAME)} "
+            "-Confirm:$false -ErrorAction SilentlyContinue; "
+            f"Register-ScheduledTask -TaskName {_ps_quote(NETGUARD_TASK_NAME)} "
+            "-Action $a -Trigger $t -Principal $p -Settings $s | Out-Null"
+        )
+        script = ("powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand "
+                  + _ps_encoded(ps))
+        result = self.run_privileged(
+            script,
+            "Для автозапуску netguard (заплановане завдання з правами "
+            "адміністратора) потрібні права адміністратора.")
+        self._log_result(result)
+        return result is not None and result.returncode == 0
 
-    def setup_autostart_netguard(self):
-        if self.netguard_autostart_installed():
-            self.step("autostart_netguard", "ok", "уже ввімкнено")
+    def remove_netguard_autostart(self):
+        system = platform.system()
+        legacy = Path.home() / ".config" / "autostart" / NETGUARD_DESKTOP
+        if legacy.exists():
+            try:
+                legacy.unlink()
+                self.log(f"Видалено {legacy}.")
+            except OSError as exc:
+                self.log_fail(f"Не вдалося видалити {legacy}: {exc}")
+        if not self.netguard_autostart_installed():
+            self.log("Автозавантаження netguard не знайдено.")
+            self._clear_netguard_marker()
             return True
-        allowed = self.ask_yesno(
-            "Автозавантаження netguard",
-            "Додати netguard до автозавантаження, щоб учитель міг керувати "
-            "доступом до інтернету?\n\n"
-            "netguard потребує прав адміністратора (root) і запускатиметься "
-            "автоматично при завантаженні системи.")
-        if not allowed:
-            self.step("autostart_netguard", "skip",
-                      "пропущено на прохання користувача")
-            return False
-        if self.install_netguard_autostart():
-            self.step("autostart_netguard", "ok", "автозавантаження додано")
-            return True
-        self.step("autostart_netguard", "warn",
-                  "не вдалося додати автозавантаження — див. журнал")
-        return False
+        result = None
+        if system == "Windows":
+            ps = (f"Unregister-ScheduledTask -TaskName {_ps_quote(NETGUARD_TASK_NAME)} "
+                  "-Confirm:$false -ErrorAction SilentlyContinue")
+            script = ("powershell -NoProfile -ExecutionPolicy Bypass "
+                      "-EncodedCommand " + _ps_encoded(ps))
+            result = self.run_privileged(
+                script, "Для видалення автозапуску netguard потрібні права "
+                        "адміністратора.")
+        elif system == "Linux":
+            script = (
+                'tmp="$(mktemp)"\n'
+                '{ crontab -l 2>/dev/null | grep -v netguard || true; } > "$tmp"\n'
+                'crontab "$tmp"\n'
+                'rm -f "$tmp"\n'
+            )
+            result = self.run_privileged(
+                script, "Для видалення автозапуску netguard потрібні права "
+                        "адміністратора.")
+        self._log_result(result)
+        ok = result is not None and result.returncode == 0
+        if ok:
+            self._clear_netguard_marker()
+            self.log_ok("Автозавантаження netguard видалено.")
+        else:
+            self.log_warn("Не вдалося видалити автозавантаження netguard.")
+        return ok
 
-    # ---------- головний робітник ----------
-    def worker(self):
+    # ---------- визначення запущених процесів ----------
+    def _is_running(self, name):
+        system = platform.system()
+        if system == "Windows":
+            if common.is_frozen():
+                image = name + ".exe"
+                result = self.run_plain(
+                    ["tasklist", "/FI", f"IMAGENAME eq {image}", "/NH"], timeout=20)
+                return (result is not None
+                        and image.lower() in (result.stdout or "").lower())
+            ps = ("Get-CimInstance Win32_Process | "
+                  "Select-Object -ExpandProperty CommandLine")
+            result = self.run_plain(["powershell", "-NoProfile", "-Command", ps],
+                                    timeout=30)
+            return result is not None and (name + ".py") in (result.stdout or "")
+        pattern = name if common.is_frozen() else name + ".py"
+        result = self.run_plain(["pgrep", "-f", pattern], timeout=20)
+        return result is not None and result.returncode == 0
+
+    # ---------- завдання: налаштування системи ----------
+    def task_setup(self):
         critical_ok = True
 
         if common.is_frozen():
-            self.step("python", "skip", "вбудований інтерпретатор")
+            self.log("Python: вбудований інтерпретатор")
         else:
             version = sys.version_info
             if version >= (3, 10):
-                self.step("python", "ok",
-                          f"Python {version.major}.{version.minor}.{version.micro}")
+                self.log_ok(f"Python {version.major}.{version.minor}.{version.micro}")
             else:
-                self.step("python", "fail",
-                          f"Python {version.major}.{version.minor} — потрібно 3.10+")
+                self.log_fail(f"Python {version.major}.{version.minor} — потрібно 3.10+")
                 critical_ok = False
 
         for sid, module, apt_pkgs, pip_pkgs in LIBS:
             if common.is_frozen():
-                self.step(sid, "skip", f"{module} вбудовано у застосунок")
+                self.log(f"{module}: вбудовано у застосунок")
                 continue
-            self.step(sid, "running", "перевірка…")
             if module_available(module):
-                self.step(sid, "ok", f"{module} доступний")
+                self.log_ok(f"{module}: доступний")
                 continue
-            self.log(f"Модуль {module} відсутній — намагаюся встановити…")
+            self.log(f"{module}: відсутній — намагаюся встановити…")
             self.install(apt_pkgs, pip_pkgs)
             if module_available(module):
-                self.step(sid, "ok", f"{module} встановлено")
+                self.log_ok(f"{module}: встановлено")
             else:
-                self.step(sid, "fail", f"не вдалося встановити {module}")
+                self.log_fail(f"{module}: не вдалося встановити")
                 if sid in CRITICAL:
                     critical_ok = False
 
-        self.step("network", "running", "перевірка…")
-        if not self.check_network():
+        ok, detail, _ips = test_broadcast()
+        if ok:
+            self.log_ok(f"Локальна мережа: {detail}")
+        else:
+            self.log_fail(f"Локальна мережа: {detail}")
             critical_ok = False
 
-        self.step("timesync", "running", "налаштування…")
+        self.log("Синхронізація часу…")
         self.setup_timesync()
 
-        self.step("firewall", "running", "налаштування…")
+        self.log("Фаєрвол…")
         self.setup_firewall()
 
-        self.step("token", "running", "перевірка…")
+        self.log("Дозвіл на вимкнення по мережі…")
+        self.setup_power_permission()
+
+        self.log("Токен доступу…")
         if not self.setup_token():
             critical_ok = False
 
-        self.step("config", "running", "перевірка…")
+        self.log("Файл налаштувань…")
         self.setup_config()
-
-        self.step("autostart_agent", "running", "…")
-        self.setup_autostart_agent()
-
-        self.step("autostart_netguard", "running", "…")
-        self.setup_autostart_netguard()
 
         if critical_ok:
             try:
                 common.mark_student_setup_complete({"critical_ok": True})
             except Exception:                         # noqa: BLE001
                 pass
-        self.q.put(("done", critical_ok))
+            return True, ("Учнівський комп'ютер налаштовано.\n\n"
+                          "За потреби скористайтеся кнопками автозавантаження.")
+        return False, ("Не всі критичні перевірки пройдено — "
+                       "перегляньте журнал у вікні.")
 
-    # ---------- завершення ----------
-    def on_done(self, ok):
-        if self.no_launch:
-            if ok:
-                messagebox.showinfo("Налаштування завершено",
-                                    "Учнівський комп'ютер успішно налаштовано.",
-                                    parent=self.root)
-            else:
-                messagebox.showwarning("Налаштування з попередженнями",
-                                       "Не всі перевірки пройдено — "
-                                       "перегляньте журнал.", parent=self.root)
-            self.root.destroy()
-            return
-        if ok:
-            title = "Налаштування завершено"
-            text = ("Учнівський комп'ютер успішно налаштовано.\n\n"
-                    "Запустити агента учня зараз?")
+    # ---------- завдання: автозавантаження ----------
+    def task_autostart_add(self):
+        results = []
+        if self.agent_autostart_installed():
+            self.log_ok("Автозавантаження агента вже ввімкнено.")
+            results.append(True)
+        elif self.install_agent_autostart():
+            self.log_ok("Агента учня додано до автозавантаження.")
+            results.append(True)
         else:
-            title = "Налаштування з попередженнями"
-            text = ("Не всі перевірки пройдено — перегляньте журнал вище.\n\n"
-                    "Запустити агента учня попри це?")
-        if messagebox.askyesno(title, text, parent=self.root):
-            self.launch_agent()
-        self.root.destroy()
+            self.log_fail("Не вдалося додати агента учня до автозавантаження.")
+            results.append(False)
 
-    def launch_agent(self):
+        if self.netguard_autostart_installed():
+            self.log_ok("Автозавантаження netguard вже ввімкнено.")
+            results.append(True)
+        elif self.install_netguard_autostart():
+            self.log_ok("netguard додано до автозавантаження.")
+            results.append(True)
+        else:
+            self.log_fail("Не вдалося додати netguard до автозавантаження.")
+            results.append(False)
+
+        if all(results):
+            return True, "Автозавантаження налаштовано."
+        return False, ("Частину пунктів автозавантаження не вдалося "
+                       "налаштувати — див. журнал.")
+
+    def task_autostart_remove(self):
+        results = []
+        if self.remove_agent_autostart():
+            results.append(True)
+        else:
+            results.append(False)
+        if self.remove_netguard_autostart():
+            results.append(True)
+        else:
+            results.append(False)
+        if all(results):
+            return True, "Автозавантаження очищено."
+        return False, ("Частину пунктів не вдалося видалити — див. журнал.")
+
+    # ---------- завдання: запуск системи ----------
+    def task_launch(self):
+        if common.program_exists(NETGUARD_NAME):
+            if self._is_running(NETGUARD_NAME):
+                self.log_ok("netguard уже працює.")
+            elif self.launch_netguard():
+                self.log_ok("netguard запущено з правами адміністратора.")
+            else:
+                self.log_fail("Не вдалося запустити netguard.")
+        else:
+            self.log_warn(f"Не знайдено застосунок {NETGUARD_NAME} поряд із цією "
+                          "програмою.")
+
+        if common.program_exists(AGENT_NAME):
+            if self._is_running(AGENT_NAME):
+                self.log_ok("Агент учня уже працює.")
+            else:
+                try:
+                    subprocess.Popen(common.program_command(AGENT_NAME),
+                                     cwd=str(BASE_DIR))
+                    self.log_ok("Агента учня запущено.")
+                except OSError as exc:
+                    self.log_fail(f"Не вдалося запустити агента учня: {exc}")
+        else:
+            self.log_warn(f"Не знайдено застосунок {AGENT_NAME} поряд із цією "
+                          "програмою.")
+
+        return True, "Запуск виконано — див. журнал."
+
+    def launch_netguard(self):
+        system = platform.system()
+        command = common.program_command(NETGUARD_NAME)
+        if system == "Windows":
+            import ctypes
+            exe, *args = command
+            try:
+                code = ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", str(exe),
+                    subprocess.list2cmdline([str(a) for a in args]) if args else "",
+                    str(BASE_DIR), 1)
+            except Exception as exc:                  # noqa: BLE001
+                self.log(f"Запит UAC не вдався: {exc}")
+                return False
+            if code > 32:
+                return True
+            self.log(f"UAC відхилено або помилка запуску (код {code}).")
+            return False
+        if system == "Linux":
+            cmd = " ".join(shlex.quote(str(part)) for part in command)
+            script = (f"cd {shlex.quote(str(BASE_DIR))} && "
+                      f"nohup {cmd} >> {NETGUARD_CRON_LOG} 2>&1 &")
+            result = self.run_privileged(
+                script,
+                "Для запуску netguard з правами адміністратора потрібен пароль.")
+            return result is not None and result.returncode == 0
+        self.log("Запуск netguard не підтримується на цій системі.")
+        return False
+
+    # ---------- завдання: перевірка параметрів ----------
+    def task_check(self):
+        self.log("— Перевірка параметрів —")
+
+        if common.is_frozen():
+            self.log("Інтерпретатор: вбудований (зібраний застосунок)")
+        else:
+            version = sys.version_info
+            self.log(f"Інтерпретатор: Python "
+                     f"{version.major}.{version.minor}.{version.micro}")
+
+        token = common.load_token()
+        if token and len(token) >= common.MIN_TOKEN_LEN:
+            self.log_ok(f"Токен: знайдено ({common.token_file_path()})")
+        else:
+            self.log_fail("Токен: не знайдено або закороткий")
+
+        if CONFIG_FILE.exists():
+            extra = ""
+            try:
+                data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+                if data.get("broadcast_address"):
+                    extra = f", broadcast {data['broadcast_address']}"
+            except (OSError, ValueError):
+                pass
+            self.log_ok(f"Файл налаштувань: {CONFIG_FILE.name}{extra}")
+        else:
+            self.log_warn("Файл налаштувань не створено (типові значення)")
+        self.log(f"Порти: TCP {self.tcp_port}, UDP(виявлення) {self.udp_port}")
+
+        ok, detail, _ips = test_broadcast()
+        if ok:
+            self.log_ok(f"Локальна мережа: {detail}")
+        else:
+            self.log_warn(f"Локальна мережа: {detail}")
+
+        self._report_timesync()
+        self._report_firewall()
+        self._report_power_permission()
+
+        if self.agent_autostart_installed():
+            self.log_ok("Автозавантаження агента: увімкнено")
+        else:
+            self.log_warn("Автозавантаження агента: вимкнено")
+        if self.netguard_autostart_installed():
+            self.log_ok("Автозавантаження netguard: увімкнено")
+        else:
+            self.log_warn("Автозавантаження netguard: вимкнено")
+
+        for label, name in (("netguard", NETGUARD_NAME),
+                            ("агент учня", AGENT_NAME)):
+            if self._is_running(name):
+                self.log_ok(f"Процес {label}: працює")
+            else:
+                self.log(f"Процес {label}: не запущено")
+
+        if common.student_setup_complete():
+            self.log_ok("Позначка завершеного налаштування: є")
+        else:
+            self.log_warn("Позначка завершеного налаштування: відсутня")
+
+        return True, "Перевірку завершено — див. журнал."
+
+    def _report_timesync(self):
+        state = None
+        if platform.system() == "Linux":
+            try:
+                state = common._ts_linux_synced()     # noqa: SLF001
+            except Exception:                         # noqa: BLE001
+                state = None
+        if state is True:
+            self.log_ok("Синхронізація часу: активна")
+        elif state is False:
+            self.log_warn("Синхронізація часу: не активна")
+        elif platform.system() == "Linux":
+            self.log("Синхронізація часу: стан невідомий")
+        else:
+            self.log("Синхронізація часу: стан не перевіряється на цій системі")
+
+    def _report_firewall(self):
+        system = platform.system()
+        if system == "Windows":
+            try:
+                state = common._fw_windows_rule_state(common.FIREWALL_RULE_NAME)
+            except Exception:                         # noqa: BLE001
+                state = "unsupported"
+            if state == "present":
+                self.log_ok("Фаєрвол: правило для вхідних портів наявне")
+            elif state == "missing":
+                self.log_warn("Фаєрвол: правило для вхідних портів відсутнє")
+            else:
+                self.log("Фаєрвол: стан невідомий")
+            return
+        if system != "Linux":
+            return
         try:
-            subprocess.Popen(common.program_command("student_agent"),
-                             cwd=str(BASE_DIR))
-        except OSError as exc:
-            messagebox.showerror("Помилка",
-                                 f"Не вдалося запустити агента учня:\n{exc}",
-                                 parent=self.root)
+            marker = common._fw_load_marker()         # noqa: SLF001
+        except Exception:                             # noqa: BLE001
+            marker = {}
+        saved = [f"{port} ({mode})" for mode, ports in marker.items()
+                 for port in ports]
+        if saved:
+            self.log_ok("Фаєрвол (збережені правила): " + ", ".join(saved))
+        try:
+            mode, _cmd = common._fw_linux_plan(self.udp_port, "udp")  # noqa: SLF001
+        except Exception:                             # noqa: BLE001
+            mode = None
+        if not mode:
+            self.log_warn("Фаєрвол: не знайдено утиліт (ufw, firewall-cmd, iptables)")
+            return
+        try:
+            state = common._fw_linux_rule_state(self.udp_port, mode, "udp")  # noqa: SLF001
+        except Exception:                             # noqa: BLE001
+            state = None
+        if state is True:
+            self.log_ok(f"Фаєрвол: вхідний UDP-порт {self.udp_port} "
+                        f"дозволено ({mode})")
+        elif state is False:
+            self.log_warn(f"Фаєрвол: вхідний UDP-порт {self.udp_port} "
+                          f"не дозволено ({mode})")
+        else:
+            self.log("Фаєрвол: стан правила невідомий (можливо, потрібні права root)")
+
+    def _report_power_permission(self):
+        if platform.system() != "Linux":
+            return
+        if self.power_permission_present():
+            self.log_ok("Вимкнення по мережі: дозвіл встановлено")
+        else:
+            self.log_warn("Вимкнення по мережі: дозвіл не встановлено "
+                          "(запустіть «Налаштування системи»)")
 
 
 def console_main():
     """Запасний варіант, якщо tkinter відсутній (без графічного інтерфейсу)."""
-    print("Увага: модуль tkinter не знайдено — графічний майстер недоступний.")
+    print("Увага: модуль tkinter не знайдено — графічне меню недоступне.")
     if platform.system() == "Linux" and common._which("apt-get"):   # noqa: SLF001
         print("Спроба встановити python3-tk та python3-pil.imagetk…")
         elev = "sudo" if common._which("sudo") else ("pkexec" if common._which("pkexec") else None)
@@ -936,9 +1310,6 @@ def main():
         except Exception:                         # noqa: BLE001
             pass
     app = SetupApp(root)
-    # --no-launch використовує агент учня: після налаштування він стартує
-    # сам, тому пропонувати запуск агента повторно не потрібно.
-    app.no_launch = "--no-launch" in sys.argv[1:]
     app.build()
     root.mainloop()
     return 0

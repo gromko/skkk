@@ -2459,42 +2459,63 @@ class ScreenViewer:
                            cursor="hand2")
         thumb.pack(pady=(2, 4))
 
-        # Бейджі стану
-        badges = tk.Frame(frame, bg=PALETTE["surface"])
-        badges.pack(fill="x", padx=8, pady=(0, 6))
-        
-        row1 = tk.Frame(badges, bg=PALETTE["surface"])
-        row1.pack(fill="x")
-        
-        badge_lock = ttk.Label(row1, text="", foreground=PALETTE["text"])
-        badge_lock.pack(side="left")
-        
-        badge_input = ttk.Label(row1, text="", foreground=PALETTE["text"])
-        badge_input.pack(side="left", padx=(8, 0))
-        
-        row2 = tk.Frame(badges, bg=PALETTE["surface"])
-        row2.pack(fill="x")
-        
-        badge_power = ttk.Label(row2, text="", foreground=PALETTE["text"])
-        badge_power.pack(side="left")
-        
-        row3 = tk.Frame(badges, bg=PALETTE["surface"])
-        row3.pack(fill="x")
-        
-        badge_net = ttk.Label(row1, text="", foreground=PALETTE["text"])
-        badge_net.pack(side="left")
+        # Повідомлення стану — одне дворядкове поле з перенесенням тексту
+        messages = tk.Text(frame, height=2, width=1, wrap="word", bd=0,
+                           highlightthickness=0, relief="flat", padx=0, pady=0,
+                           bg=PALETTE["surface"], fg=PALETTE["text"],
+                           font=("Segoe UI", 9), cursor="arrow", takefocus=0,
+                           exportselection=False, state="disabled")
+        messages.pack(fill="x", padx=8, pady=(0, 6))
+        messages.tag_configure("sep", foreground=PALETTE["muted"])
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            messages.bind(seq, self._forward_wheel)
 
         # Уся картка (крім чекбокса) відкриває повномасштабний перегляд
-        self._bind_card_open(frame, client_id, skip={chk_box, thumb})
+        self._bind_card_open(frame, client_id, skip={chk_box, thumb, messages})
 
         return {"frame": frame, "thumb": thumb, "var": var,
-                "address": address,
-                "badge": badge_lock, "input_badge": badge_input,
-                "power_badge": badge_power,
-                "net_badge": badge_net,
+                "address": address, "messages": messages,
                 "name": item["name"], "photo": None, "last_image": None,
-                "last_lock_text": None, "last_input_text": None,
-                "last_power_text": None, "last_net_text": None}
+                "last_messages": None}
+
+    def _forward_wheel(self, event):
+        """Прокручує сітку карток, коли коліщатко над полем повідомлень."""
+        if event.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif event.num == 5:
+            self.canvas.yview_scroll(1, "units")
+        else:
+            self.canvas.yview_scroll(-1 * (event.delta // 120), "units")
+        return "break"
+
+    def _card_tag(self, widget, color):
+        """Ім'я тега tk.Text для заданого кольору тексту."""
+        tag = "c" + color.lstrip("#")
+        if tag not in widget.tag_names():
+            widget.tag_configure(tag, foreground=color)
+        return tag
+
+    def _draw_card_messages(self, widget, entries):
+        """Малює повідомлення стану в одному дворядковому полі (іконка + текст)."""
+        try:
+            widget.configure(state="normal")
+        except tk.TclError:
+            return
+        widget.delete("1.0", "end")
+        first = True
+        for text, color, icon in entries:
+            if not text:
+                continue
+            if not first:
+                widget.insert("end", "  ·  ", "sep")
+            first = False
+            if icon:
+                photo = self._load_icon(icon, 14)
+                if photo is not None:
+                    widget.image_create("end", image=photo)
+                    widget.insert("end", " ")
+            widget.insert("end", text, self._card_tag(widget, color))
+        widget.configure(state="disabled")
 
     def _make_placeholder(self):
         """Порожній прямокутник для неактивного місця у сітці."""
@@ -2593,50 +2614,21 @@ class ScreenViewer:
             try:
                 self.update_thumb(card, item)
 
-                # Lock badge
+                # Повідомлення стану (одне дворядкове поле з перенесенням)
                 desired = item["address"] in locked_addrs
-                text, color, icon = self.lock_badge(item, desired)
-                sig = (text, icon)
-                if sig != card.get("last_lock_text"):
-                    card["badge"].configure(
-                        text=text, foreground=color,
-                        image=self._load_icon(icon, 14) if icon else "",
-                        compound="left" if icon else "none")
-                    card["last_lock_text"] = sig
-
-                # Input badge
                 input_desired = item["address"] in input_blocked_addrs
-                itext, icolor, iicon = self.input_badge(item, input_desired)
-                isig = (itext, iicon)
-                if isig != card.get("last_input_text"):
-                    card["input_badge"].configure(
-                        text=itext, foreground=icolor,
-                        image=self._load_icon(iicon, 14) if iicon else "",
-                        compound="left" if iicon else "none")
-                    card["last_input_text"] = isig
-
-                # Power badge
-                ptext, pcolor, picon = self.power_badge(item)
-                psig = (ptext, picon)
-                if psig != card.get("last_power_text"):
-                    card["power_badge"].configure(
-                        text=ptext, foreground=pcolor,
-                        image=self._load_icon(picon, 14) if picon else "",
-                        compound="left" if picon else "none")
-                    card["last_power_text"] = psig
-
-                # Net badge
                 net_desired = item["address"] in net_blocked_addrs
-                ntext, ncolor, nicon = self.net_badge(
-                    net_state.get(item["address"]), net_desired,
-                    item["address"] in net_clients)
-                nsig = (ntext, nicon)
-                if nsig != card.get("last_net_text"):
-                    card["net_badge"].configure(
-                        text=ntext, foreground=ncolor,
-                        image=self._load_icon(nicon, 14) if nicon else "",
-                        compound="left" if nicon else "none")
-                    card["last_net_text"] = nsig
+                entries = [
+                    self.lock_badge(item, desired),
+                    self.input_badge(item, input_desired),
+                    self.power_badge(item),
+                    self.net_badge(net_state.get(item["address"]), net_desired,
+                                   item["address"] in net_clients),
+                ]
+                sig = tuple((text, icon) for text, _color, icon in entries)
+                if sig != card.get("last_messages"):
+                    self._draw_card_messages(card["messages"], entries)
+                    card["last_messages"] = sig
             except tk.TclError:
                 pass
 
