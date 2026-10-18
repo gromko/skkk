@@ -5,7 +5,7 @@
   * «Налаштування системи» — перевіряє/встановлює потрібні компоненти
     (tkinter, Pillow, ImageTk, mss), перевіряє локальну мережу, вмикає
     синхронізацію часу, відкриває вхідний UDP-порт у фаєрволі, дозволяє
-    вимкнення по мережі (polkit), імпортує токен доступу з комп'ютера
+    вимкнення по мережі (sudoers), імпортує токен доступу з комп'ютера
     вчителя та створює файл налаштувань;
   * «Додати в Автозавантаження» — додає агента учня (student_agent) та
     привілейований netguard до автозавантаження при вході в систему;
@@ -22,6 +22,7 @@ import json
 import os
 import platform
 import queue
+import re
 import shlex
 import socket
 import subprocess
@@ -76,22 +77,12 @@ NETGUARD_TASK_NAME = "ClassroomNetguard"
 NETGUARD_DESKTOP = "netguard.desktop"
 NETGUARD_CRON_LOG = "/var/log/netguard.log"
 
-# polkit-правило, яке дозволяє локальному користувачу вимикати комп'ютер
-# без пароля — потрібне, щоб агент учня виконав команду вчителя «вимкнути».
+# Файл sudoers, який дозволяє користувачу учня вимикати комп'ютер без пароля,
+# щоб агент учня виконав команду вчителя «вимкнути» через sudo.
+SUDOERS_PATH = common.SUDOERS_POWER_FILE
+SUDOERS_TMP = "/etc/sudoers.d/.classroom-poweroff.tmp"
+# Застаріле polkit-правило (раніші версії); прибираємо під час налаштування.
 POLKIT_RULES_PATH = Path("/etc/polkit-1/rules.d/49-classroom-poweroff.rules")
-POLKIT_RULES_DIR = POLKIT_RULES_PATH.parent
-POLKIT_RULE_CONTENT = (
-    "// SKKK: дозволяє локальному користувачу вимикати комп'ютер\n"
-    "// за командою вчителя без запиту пароля (агент учня, polkit/logind).\n"
-    "polkit.addRule(function(action, subject) {\n"
-    "    if ((action.id == \"org.freedesktop.login1.power-off\" ||\n"
-    "         action.id == \"org.freedesktop.login1.power-off-multiple-sessions\" ||\n"
-    "         action.id == \"org.freedesktop.login1.power-off-ignore-inhibit\") &&\n"
-    "        subject.local) {\n"
-    "        return polkit.Result.YES;\n"
-    "    }\n"
-    "});\n"
-)
 
 STATE_DIR = Path.home() / ".config" / "classroom_screen_monitor"
 NETGUARD_AUTOSTART_MARKER = STATE_DIR / "netguard_autostart.json"
@@ -570,38 +561,77 @@ class SetupApp:
             self.log((result.stderr or "").strip())
         return False
 
-    @staticmethod
-    def power_permission_present():
-        """Чи встановлено polkit-правило для вимкнення по мережі."""
+    POWER_MARKER = STATE_DIR / "power_permission.json"
+
+    @classmethod
+    def power_permission_present(cls):
+        """Чи встановлено дозвіл на вимкнення по мережі (sudoers)."""
         try:
-            return "login1.power-off" in POLKIT_RULES_PATH.read_text(encoding="utf-8")
+            return "poweroff" in SUDOERS_PATH.read_text(encoding="utf-8")
         except OSError:
-            return False
+            pass
+        # Звичайний користувач не може прочитати /etc/sudoers.d — покладаємось
+        # на маркер, записаний після успішного встановлення.
+        return cls.POWER_MARKER.exists()
+
+    @classmethod
+    def _write_power_marker(cls, installed):
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            if installed:
+                cls.POWER_MARKER.write_text(
+                    json.dumps({"mechanism": "sudoers"}), encoding="utf-8")
+            else:
+                cls.POWER_MARKER.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _sudoers_content(user, paths):
+        line = f"{user} ALL=(root) NOPASSWD: {', '.join(paths)}"
+        return ("# SKKK: безпарольне вимкнення комп'ютера учня за командою "
+                "вчителя\n" + line + "\n")
 
     def setup_power_permission(self):
-        """Дозволяє локальному користувачу вимикати комп'ютер без пароля, щоб
-        агент учня (не root) виконав команду вчителя «вимкнути» через
-        logind/systemctl. Помилки не критичні для роботи агента."""
+        """Дозволяє користувачу учня вимикати комп'ютер без пароля, щоб агент
+        (не root) виконав команду вчителя «вимкнути» через sudo. Створює файл
+        /etc/sudoers.d/classroom-poweroff. Помилки не критичні для агента."""
         if platform.system() != "Linux":
             return False
         if self.power_permission_present():
             self.log_ok("Дозвіл на вимкнення по мережі вже встановлено")
             return True
-        if not POLKIT_RULES_DIR.is_dir() and not common._which("pkcheck"):  # noqa: SLF001
-            self.log_warn("polkit не знайдено — вимкнення по мережі може не працювати")
+        user = common.invoking_user()
+        if not user or not re.fullmatch(r"[A-Za-z0-9_.@-]+", user):
+            self.log_warn("Не вдалося визначити користувача для дозволу вимкнення.")
             return False
+        paths = common.power_bin_paths()
+        if not paths:
+            self.log_warn("Не знайдено утиліт poweroff/shutdown — вимкнення "
+                          "по мережі може не працювати.")
+            return False
+        if common._which("sudo") is None:  # noqa: SLF001
+            self.log_warn("Утиліту sudo не знайдено — агент не зможе скористатися "
+                          "цим дозволом (встановіть sudo).")
+        content = self._sudoers_content(user, paths)
         script = (
-            f"install -d -m 0755 {shlex.quote(str(POLKIT_RULES_DIR))} && "
-            f"cat > {shlex.quote(str(POLKIT_RULES_PATH))} <<'SKKK_POLKIT_EOF'\n"
-            + POLKIT_RULE_CONTENT +
-            "SKKK_POLKIT_EOF\n"
-            f"chmod 0644 {shlex.quote(str(POLKIT_RULES_PATH))}"
+            "set -e; "
+            "install -d -m 0750 /etc/sudoers.d; "
+            f"tmp={shlex.quote(SUDOERS_TMP)}; "
+            "cat > \"$tmp\" <<'SKKK_SUDOERS_EOF'\n" + content +
+            "SKKK_SUDOERS_EOF\n"
+            "chmod 0440 \"$tmp\"; "
+            "if command -v visudo >/dev/null 2>&1; then "
+            "visudo -cf \"$tmp\" || { rm -f \"$tmp\"; exit 1; }; fi; "
+            f"install -m 0440 -o root -g root \"$tmp\" {shlex.quote(str(SUDOERS_PATH))}; "
+            "rm -f \"$tmp\"; "
+            f"rm -f {shlex.quote(str(POLKIT_RULES_PATH))}"
         )
         result = self.run_privileged(
             script, "Для дозволу вимкнення по мережі потрібні права root.")
-        if result is not None and result.returncode == 0 \
-                and self.power_permission_present():
-            self.log_ok("Дозвіл на вимкнення по мережі встановлено")
+        if result is not None and result.returncode == 0:
+            self._write_power_marker(True)
+            self.log_ok(f"Дозвіл на вимкнення встановлено для «{user}» (sudoers)")
             return True
         if result is not None and (result.stderr or "").strip():
             self.log((result.stderr or "").strip())
@@ -1278,7 +1308,7 @@ class SetupApp:
         if platform.system() != "Linux":
             return
         if self.power_permission_present():
-            self.log_ok("Вимкнення по мережі: дозвіл встановлено")
+            self.log_ok("Вимкнення по мережі: дозвіл встановлено (sudoers)")
         else:
             self.log_warn("Вимкнення по мережі: дозвіл не встановлено "
                           "(запустіть «Налаштування системи»)")

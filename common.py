@@ -758,6 +758,45 @@ def clean_env(env=None):
     return env
 
 
+# ---------- Безпарольне вимкнення агента учня (sudoers) ----------
+
+# Файл sudoers, що дозволяє користувачу учня вимикати комп'ютер без пароля
+# за командою вчителя. Створюється меню налаштування (skkk_student_setup).
+SUDOERS_POWER_FILE = Path("/etc/sudoers.d/classroom-poweroff")
+# Типові шляхи до poweroff/shutdown; потрібні і для sudoers, і для команд агента.
+POWER_BIN_CANDIDATES = ("/usr/sbin/poweroff", "/sbin/poweroff", "/usr/bin/poweroff",
+                        "/usr/sbin/shutdown", "/sbin/shutdown", "/usr/bin/shutdown")
+
+
+def power_bin_paths():
+    """Наявні в системі шляхи до ``poweroff``/``shutdown`` (для sudoers і команд)."""
+    return [p for p in POWER_BIN_CANDIDATES if os.path.exists(p)]
+
+
+def invoking_user():
+    """Ім'я користувача, який запустив програму — навіть якщо вона підвищила
+    права через sudo (``SUDO_USER``) або pkexec (``PKEXEC_UID``)."""
+    user = os.environ.get("SUDO_USER")
+    if user:
+        return user
+    uid = os.environ.get("PKEXEC_UID")
+    try:
+        import pwd
+    except ImportError:
+        pwd = None
+    if uid and uid.isdigit() and pwd is not None:
+        try:
+            return pwd.getpwuid(int(uid)).pw_name
+        except KeyError:
+            pass
+    if pwd is not None and hasattr(os, "getuid") and os.getuid() != 0:
+        try:
+            return pwd.getpwuid(os.getuid()).pw_name
+        except KeyError:
+            pass
+    return os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+
+
 def _fw_run(cmd, timeout=120):
     """Тихий запуск команди; None, якщо утиліту не знайдено або сталася помилка."""
     flags = 0x08000000 if sys.platform == "win32" else 0   # CREATE_NO_WINDOW

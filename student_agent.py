@@ -37,7 +37,7 @@ from common import (MAX_FRAME_BYTES, MAX_MESSAGE_CHARS, MSG_DEMO, MSG_FILE_DATA,
                     clean_env, format_size,
                     is_risky_file, is_video_file, is_youtube_url,
                     load_config, load_token, new_mss, discover_teacher,
-                    program_command, program_path,
+                    power_bin_paths, program_command, program_path,
                     recv_packet, safe_filename, send_packet, token_file_path,
                     student_setup_complete)
 
@@ -132,8 +132,27 @@ class PowerManager:
         if system == "Darwin":
             return [["osascript", "-e", 'tell application "System Events" to shut down'],
                     ["shutdown", "-h", "now"]]
-        return [["systemctl", "poweroff"], ["systemctl", "poweroff", "-i"],
-                ["loginctl", "poweroff"], ["shutdown", "-h", "now"], ["poweroff"]]
+        commands = []
+        is_root = getattr(os, "geteuid", lambda: 1)() == 0
+        sudo = shutil.which("sudo")
+        for path in power_bin_paths():
+            if is_root:
+                commands.append([path] if "poweroff" in path
+                                else [path, "-h", "now"])
+            elif sudo:
+                # Безпарольне вимкнення за правилом sudoers, встановленим
+                # меню налаштування (skkk_student_setup → /etc/sudoers.d).
+                commands.append([sudo, "-n", path] if "poweroff" in path
+                                else [sudo, "-n", path, "-h", "now"])
+        commands += [["systemctl", "poweroff"], ["systemctl", "poweroff", "-i"],
+                     ["loginctl", "poweroff"], ["shutdown", "-h", "now"], ["poweroff"]]
+        seen, unique = set(), []
+        for cmd in commands:
+            key = tuple(cmd)
+            if key not in seen:
+                seen.add(key)
+                unique.append(cmd)
+        return unique
 
     def _execute(self):
         error = "Не знайдено команди вимкнення"
