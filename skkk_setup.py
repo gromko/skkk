@@ -328,7 +328,8 @@ class SetupApp:
     def run_plain(self, cmd, input=None, timeout=None):
         try:
             return subprocess.run(cmd, capture_output=True, text=True,
-                                  input=input, timeout=timeout)
+                                  input=input, timeout=timeout,
+                                  env=common.clean_env())
         except (OSError, subprocess.SubprocessError) as exc:
             self.log(f"Помилка виконання {cmd[0]}: {exc}")
             return None
@@ -647,7 +648,7 @@ class SetupApp:
     def launch_teacher(self):
         try:
             subprocess.Popen(common.program_command("teacher"),
-                             cwd=str(BASE_DIR))
+                             cwd=str(BASE_DIR), env=common.clean_env())
         except OSError as exc:
             messagebox.showerror("Помилка",
                                  f"Не вдалося запустити програму вчителя:\n{exc}",
@@ -662,7 +663,8 @@ def console_main():
         elev = "sudo" if common._which("sudo") else ("pkexec" if common._which("pkexec") else None)
         if elev:
             subprocess.run([elev, "apt-get", "install", "-y",
-                            "python3-tk", "python3-pil.imagetk"])
+                            "python3-tk", "python3-pil.imagetk"],
+                           env=common.clean_env())
             print("Готово. Перезапустіть skkk_setup.py.")
             return 0
     print("Встановіть вручну:  sudo apt install python3-tk python3-pil.imagetk")

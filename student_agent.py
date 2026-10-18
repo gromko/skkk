@@ -34,7 +34,7 @@ from common import (MAX_FRAME_BYTES, MAX_MESSAGE_CHARS, MSG_DEMO, MSG_FILE_DATA,
                     capture_jpeg,
                     client_handshake, default_save_dir, ensure_firewall_port,
                     ensure_time_sync,
-                    format_size,
+                    clean_env, format_size,
                     is_risky_file, is_video_file, is_youtube_url,
                     load_config, load_token, new_mss, discover_teacher,
                     program_command, program_path,
@@ -138,10 +138,11 @@ class PowerManager:
     def _execute(self):
         error = "Не знайдено команди вимкнення"
         flags = 0x08000000 if sys.platform == "win32" else 0     # CREATE_NO_WINDOW
+        env = clean_env()
         for command in self.commands():
             try:
                 result = subprocess.run(command, capture_output=True, text=True, timeout=30,
-                                        creationflags=flags)
+                                        creationflags=flags, env=env)
             except (OSError, subprocess.SubprocessError) as exc:
                 error = str(exc)[:200]
                 continue
@@ -884,14 +885,7 @@ def _desktop_session():
 
 def _clean_env(env):
     """Прибирає підміни середовища (PyInstaller тощо) і гарантує PATH."""
-    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONPATH"):
-        orig = env.get(key + "_ORIG")
-        if orig is not None:
-            env[key] = orig
-        elif getattr(sys, "frozen", False):
-            env.pop(key, None)
-    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")
-    return env
+    return clean_env(env)
 
 
 def open_url_in_browser(url):
@@ -1022,13 +1016,14 @@ class MediaController:
                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
             except OSError:
                 return None
+        env = clean_env()
         for name in self._LINUX_PLAYERS:
-            exe = shutil.which(name)
+            exe = shutil.which(name, path=env["PATH"])
             if exe:
                 for extra in (["--fullscreen"], []):
                     try:
                         return subprocess.Popen(
-                            [exe, *extra, path],
+                            [exe, *extra, path], env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     except OSError:
                         continue
@@ -1044,7 +1039,8 @@ class MediaController:
             self._dismiss()
             self._wait_until_idle(path)
             return
-        opener = shutil.which("xdg-open")
+        env = clean_env()
+        opener = shutil.which("xdg-open", path=env["PATH"])
         if not opener:
             try:
                 self.notify("У системі не знайдено відеоплеєра для відтворення.")
@@ -1052,7 +1048,7 @@ class MediaController:
                 pass
             return
         try:
-            subprocess.Popen([opener, path], stdout=subprocess.DEVNULL,
+            subprocess.Popen([opener, path], env=env, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
         except OSError:
             return
@@ -1592,7 +1588,7 @@ def _run_student_setup():
     print("Середовище ще не налаштоване — запускаю меню налаштування…")
     try:
         subprocess.run(program_command("skkk_student_setup", "--no-launch"),
-                       cwd=str(app_dir()), check=False)
+                       cwd=str(app_dir()), check=False, env=clean_env())
     except OSError as exc:
         print(f"Не вдалося запустити меню налаштування: {exc}", file=sys.stderr)
 

@@ -30,9 +30,9 @@ import sys
 import threading
 import time
 
-from common import (MSG_NET, MSG_NET_STATE, ROLE_NET, _which, client_handshake,
-                    discover_teacher, load_config, load_token, recv_packet,
-                    send_packet, token_file_path)
+from common import (MSG_NET, MSG_NET_STATE, ROLE_NET, _which, clean_env,
+                    client_handshake, discover_teacher, load_config, load_token,
+                    recv_packet, send_packet, token_file_path)
 
 
 class NetworkGuard:
@@ -95,7 +95,7 @@ class NetworkGuard:
                 resolved = _which(cmd[0])
                 if resolved:
                     cmd[0] = resolved
-            env = dict(os.environ)
+            env = clean_env()
             env["PATH"] = (env.get("PATH", "") + ":" +
                            "/usr/sbin:/sbin:/usr/local/sbin").strip(":")
         try:

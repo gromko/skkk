@@ -735,6 +735,29 @@ def _which(tool):
     return None
 
 
+def clean_env(env=None):
+    """Копія середовища без підмін PyInstaller — для запуску сторонніх програм.
+
+    PyInstaller у Linux додає теку зі своїми бібліотеками на початок
+    ``LD_LIBRARY_PATH``. Якщо дочірній процес — системна утиліта (``systemctl``,
+    ``shutdown``, ``poweroff``) або чужий застосунок, він підхоплює несумісні
+    вбудовані бібліотеки і падає (напр. ``poweroff: version `OPENSSL_3.4.0'
+    not found``). Тому відновлюємо початкове значення (з ``*_ORIG``) або
+    прибираємо змінну. Гарантуємо базовий ``PATH``."""
+    env = dict(os.environ if env is None else env)
+    for key in ("LD_LIBRARY_PATH", "LD_PRELOAD", "PYTHONHOME", "PYTHONPATH"):
+        orig = env.get(key + "_ORIG")
+        if orig is not None:
+            if orig:
+                env[key] = orig
+            else:
+                env.pop(key, None)
+        elif is_frozen():
+            env.pop(key, None)
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin")
+    return env
+
+
 def _fw_run(cmd, timeout=120):
     """Тихий запуск команди; None, якщо утиліту не знайдено або сталася помилка."""
     flags = 0x08000000 if sys.platform == "win32" else 0   # CREATE_NO_WINDOW
@@ -746,7 +769,7 @@ def _fw_run(cmd, timeout=120):
             if resolved:
                 cmd[0] = resolved
         # Розширюємо PATH і для дочірніх процесів (напр. sh -c "ufw allow ...").
-        env = dict(os.environ)
+        env = clean_env()
         extra = ":".join(_PATH_FALLBACK_DIRS)
         env["PATH"] = (env.get("PATH", "") + ":" + extra).strip(":")
     try:

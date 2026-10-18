@@ -29,6 +29,7 @@ from common import (FILE_CHUNK, MAX_FILES_PER_SEND, MAX_MESSAGE_CHARS, MSG_DEMO,
                     build_announcement,
                     bundle_dir,
                     capture_jpeg,
+                    clean_env,
                     format_size,
                     is_risky_file, is_video_file, is_youtube_url,
                     load_config, load_token, local_broadcast_targets,
@@ -2724,7 +2725,7 @@ def _run_setup(root):
     root.withdraw()
     try:
         subprocess.run(program_command(SETUP_PROGRAM, "--no-launch"),
-                       cwd=str(app_dir()), check=False)
+                       cwd=str(app_dir()), check=False, env=clean_env())
     except OSError as exc:
         messagebox.showerror(
             "Налаштування середовища",
