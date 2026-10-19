@@ -23,7 +23,7 @@ from common import (FILE_CHUNK, MAX_FILES_PER_SEND, MAX_MESSAGE_CHARS, MSG_DEMO,
                     MSG_NET, MSG_NET_STATE,
                     MSG_POWER, MSG_POWER_STATE,
                     MSG_STOP, MSG_TEXT,
-                    MSG_VIDEO_RESULT, MSG_VIDEO_STOP, MSG_YOUTUBE,
+                    MSG_VIDEO_PAUSE, MSG_VIDEO_RESULT, MSG_VIDEO_STOP, MSG_YOUTUBE,
                     app_dir,
                     app_icon_path,
                     build_announcement,
@@ -1455,10 +1455,16 @@ class ScreenViewer:
                                      foreground=PALETTE["muted"],
                                      wraplength=300, justify="left")
         self.video_label.pack(anchor="w", pady=(4, 12))
-        ttk.Button(body, text="Зупинити й видалити файл",
+        self.video_paused = False
+        btns = ttk.Frame(body)
+        btns.pack()
+        self.video_pause_btn = ttk.Button(btns, text="Пауза",
+                                          command=self.pause_video)
+        self.video_pause_btn.pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Закрити плеєр",
                    image=self._icons["stop"], compound="left",
                    style="Danger.TButton",
-                   command=self.stop_video).pack()
+                   command=self.stop_video).pack(side="left")
         panel.geometry("340x170")
         panel.resizable(False, False)
         panel.protocol("WM_DELETE_WINDOW", self.stop_video)
@@ -1481,6 +1487,18 @@ class ScreenViewer:
         self.video_pending.discard(address)
         if not self.video_pending:
             self.close_video_panel()
+
+    def pause_video(self):
+        """Пауза/продовження у всіх учнів (на боці учня — перемикач)."""
+        with self.lock:
+            for client in self.clients.values():
+                if client["address"] in self.video_targets:
+                    client["outbox"].append(MSG_VIDEO_PAUSE)
+                    client["wake"].set()
+        self.video_paused = not getattr(self, "video_paused", False)
+        btn = getattr(self, "video_pause_btn", None)
+        if btn is not None and btn.winfo_exists():
+            btn.configure(text="Продовжити" if self.video_paused else "Пауза")
 
     def stop_video(self):
         with self.lock:

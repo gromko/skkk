@@ -151,6 +151,7 @@ MAX_FILES_PER_SEND = 20
 # учень зберігає його в тимчасовій теці, відтворює штатним плеєром і видаляє.
 MSG_VIDEO_STOP = b"X"    # вчитель -> учень: зупинити відтворення й видалити файл
 MSG_YOUTUBE = b"Z"       # вчитель -> учень: JSON {"url": посилання на YouTube}
+MSG_VIDEO_PAUSE = b"W"   # вчитель -> учень: пауза / продовження відтворення (перемикач)
 MSG_VIDEO_RESULT = b"Y"  # учень -> вчитель: JSON {id, phase, ok, error}
 # phase: "playing" | "done" | "error"
 

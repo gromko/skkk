@@ -19,6 +19,7 @@ Windows: одне блокувальне правило фаєрвола на в
 """
 import argparse
 import ctypes
+import ipaddress
 import json
 import os
 import platform
@@ -29,6 +30,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 
 from common import (MSG_NET, MSG_NET_STATE, ROLE_NET, _which, clean_env,
                     client_handshake, discover_teacher, load_config, load_token,
@@ -118,6 +120,36 @@ class NetworkGuard:
         except Exception:
             return False
 
+    def _internet_ranges_windows(self):
+        """Доповнення до приватних діапазонів (та IP вчителя) — явний список
+        для remoteip. Ключове слово "Internet" у netsh приймають не всі збірки
+        Windows (помилка про недійсну IP-адресу), тому рахуємо діапазони самі."""
+        def complement(whole, keep):
+            nets = [whole]
+            for k in keep:
+                nxt = []
+                for n in nets:
+                    if n.version != k.version or not n.overlaps(k):
+                        nxt.append(n)
+                    elif k.subnet_of(n):
+                        nxt.extend(n.address_exclude(k))
+                    # якщо n повністю всередині k — відкидаємо
+                nets = nxt
+            return sorted(nets, key=lambda n: n.network_address)
+        keep4 = [ipaddress.ip_network(x) for x in self.PRIVATE_V4]
+        keep6 = [ipaddress.ip_network(x) for x in self.PRIVATE_V6]
+        keep4.append(ipaddress.ip_network("0.0.0.0/8"))
+        try:
+            if self.teacher_ip:
+                t = ipaddress.ip_address(self.teacher_ip)
+                (keep4 if t.version == 4 else keep6).append(
+                    ipaddress.ip_network(t.exploded + ("/32" if t.version == 4 else "/128")))
+        except ValueError:
+            pass
+        res = complement(ipaddress.ip_network("0.0.0.0/0"), keep4)
+        res += complement(ipaddress.ip_network("::/0"), keep6)
+        return ",".join(str(n) for n in res)
+
     def _block_windows(self):
         if not self._is_admin_windows():
             return False, "unsupported", ("Потрібні права адміністратора. Запустіть "
@@ -126,7 +158,7 @@ class NetworkGuard:
                       f"name={self.RULE_NAME}"])   # прибираємо дублікати від попередніх спроб
         result = self._run_cmd(["netsh", "advfirewall", "firewall", "add", "rule",
                                f"name={self.RULE_NAME}", "dir=out", "action=block",
-                               "remoteip=Internet", "profile=any", "protocol=any", "enable=yes"])
+                               f"remoteip={self._internet_ranges_windows()}", "profile=any", "protocol=any", "enable=yes"])
         if result is None:
             return False, "unsupported", "Команду netsh не знайдено"
         if result.returncode != 0:
@@ -194,6 +226,17 @@ class NetworkGuard:
         return True, "linux_iptables", ""
 
 
+def _log(text):
+    """Діагностичний журнал netguard.log поряд із netguard (щоб бачити причину,
+    навіть коли консоль закрито)."""
+    try:
+        path = os.path.join(os.path.dirname(token_file_path(None)), "netguard.log")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S ") + text.rstrip() + "\n")
+    except Exception:
+        pass
+
+
 def send_state(sock, state, mode, error="", initial=False):
     send_packet(sock, MSG_NET_STATE + json.dumps(
         {"state": state, "mode": mode, "initial": initial, "error": error},
@@ -211,12 +254,19 @@ def session(ip, port, token, name, guard, stop_event):
         state, mode = guard.current_state()
         send_state(sock, state, mode, initial=True)
         applied_at = time.time() if state == "blocked" else 0.0
+        last_state, last_mode = state, mode
+        last_sent = time.time()
         while not stop_event.is_set():
             try:
                 ready, _, _ = select.select([sock], [], [], 1.0)
             except (OSError, ValueError):
                 break
             if not ready:
+                # keepalive: учитель закриває з'єднання після 90 с тиші, тому
+                # періодично повторюємо поточний стан (не "initial")
+                if time.time() - last_sent >= 20:
+                    send_state(sock, last_state, last_mode)
+                    last_sent = time.time()
                 continue
             try:
                 packet = recv_packet(sock)
@@ -226,15 +276,22 @@ def session(ip, port, token, name, guard, stop_event):
                 continue
             want_block = packet[1:2] == b"\x01"
             send_state(sock, "working", guard.mode)
+            _log(f"MSG_NET want_block={want_block}")
             ok, mode, error = guard.apply(want_block)
+            _log(f"apply -> ok={ok} mode={mode} error={error}")
             if ok:
                 if want_block:
                     applied_at = time.time()
-                send_state(sock, "blocked" if want_block else "none", mode, "")
+                last_state, last_mode = ("blocked" if want_block else "none"), mode
+                send_state(sock, last_state, last_mode, "")
+                last_sent = time.time()
+                if not want_block:
+                    applied_at = 0.0
                 print("Інтернет заблоковано." if want_block else "Інтернет розблоковано.")
             else:
                 send_state(sock, "error", mode, error or "Помилка")
                 print(f"Не вдалося змінити блокування: {error}", file=sys.stderr)
+        _log(f"сесію завершено; applied_at={'так' if applied_at else 'ні'}")
         # зв'язок із учителем обірвався невдовзі після блокування — знімаємо як
         # запобіжник, щоб правило не залишило комп'ютер без інтернету назавжди
         if applied_at and time.time() - applied_at < 20:
@@ -263,8 +320,9 @@ def run_client(args, token, guard, stop_event):
                 if args.teacher_ip:
                     return 3
                 stop_event.wait(3)
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            print(f"З'єднання перервано: {exc}. Повтор через 3 с…", file=sys.stderr)
+        except Exception as exc:   # netguard не повинен завершуватися через несподівану помилку
+            print(f"З'єднання перервано: {exc!r}. Повтор через 3 с…", file=sys.stderr)
+            _log("run_client: " + traceback.format_exc())
             stop_event.wait(3)
     return 0
 

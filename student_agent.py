@@ -29,7 +29,7 @@ from common import (MAX_FRAME_BYTES, MAX_MESSAGE_CHARS, MSG_DEMO, MSG_FILE_DATA,
                     MSG_INPUT, MSG_INPUT_STATE, MSG_LOCK, MSG_LOCK_STATE,
                     MSG_POWER,
                     MSG_POWER_STATE, MSG_STOP, MSG_TEXT, MIN_TOKEN_LEN,
-                    MSG_VIDEO_RESULT, MSG_VIDEO_STOP, MSG_YOUTUBE,
+                    MSG_VIDEO_PAUSE, MSG_VIDEO_RESULT, MSG_VIDEO_STOP, MSG_YOUTUBE,
                     app_dir, app_icon_path,
                     capture_jpeg,
                     client_handshake, default_save_dir, ensure_firewall_port,
@@ -977,6 +977,7 @@ class MediaController:
         self.proc = None
         self.playing_path = None
         self.playing_id = None
+        self.paused = False
 
     def _dismiss(self):
         """Закриває сповіщення про відео, щойно почалося відтворення."""
@@ -994,6 +995,7 @@ class MediaController:
         with self.lock:
             self.playing_path = path
             self.playing_id = fid
+        self.paused = False
         self._report(fid, "playing", True)
         try:
             self.notify_auto(f"Відтворюється відео:\n{os.path.basename(path)}")
@@ -1003,6 +1005,7 @@ class MediaController:
                          daemon=True).start()
 
     def _play_worker(self, path, fid):
+        detached = False
         try:
             proc = self._launch(path)
             if proc is not None:
@@ -1011,10 +1014,12 @@ class MediaController:
                 self._dismiss()
                 proc.wait()
             else:
-                self._launch_default(path)
+                detached = bool(self._launch_default(path))
         except Exception as exc:
             self._report(fid, "error", False, str(exc))
         finally:
+            if detached:
+                return    # Windows: штатний UWP-плеєр — тримаємо стан, доки вчитель не закриє
             with self.lock:
                 current = self.playing_path == path
                 if current:
@@ -1029,12 +1034,16 @@ class MediaController:
         """Запускає відтворення, якщо вдалося підібрати плеєр. Повертає Popen
         (щоб дочекатися завершення) або None — тоді запускаємо штатний обробник."""
         if sys.platform == "win32":
-            try:
-                return subprocess.Popen(
-                    ["cmd", "/c", "start", "/wait", "", path],
-                    creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-            except OSError:
-                return None
+            # Без cmd-вікна. Класичний плеєр (VLC/mpv/WMP) запускаємо напряму —
+            # його можна дочекатися і зупинити. Інакше — штатний обробник ОС.
+            exe = self._find_windows_player()
+            if exe:
+                try:
+                    return subprocess.Popen(
+                        [exe, path], creationflags=0x08000000)  # CREATE_NO_WINDOW
+                except OSError:
+                    pass
+            return None
         env = clean_env()
         for name in self._LINUX_PLAYERS:
             exe = shutil.which(name, path=env["PATH"])
@@ -1048,6 +1057,22 @@ class MediaController:
                         continue
         return None
 
+    @staticmethod
+    def _find_windows_player():
+        names = ("vlc.exe", "mpv.exe", "wmplayer.exe")
+        for name in names:
+            exe = shutil.which(name)
+            if exe:
+                return exe
+        roots = [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")]
+        rel = (r"VideoLAN\VLC\vlc.exe", r"Windows Media Player\wmplayer.exe")
+        for root in filter(None, roots):
+            for r in rel:
+                cand = os.path.join(root, r)
+                if os.path.isfile(cand):
+                    return cand
+        return None
+
     def _launch_default(self, path):
         """Відкриває файл штатним відеоплеєром ОС (через обробник за замовчуванням)."""
         if sys.platform == "win32":
@@ -1056,8 +1081,7 @@ class MediaController:
             except OSError:
                 pass
             self._dismiss()
-            self._wait_until_idle(path)
-            return
+            return True    # відв'язаний плеєр: закриє вчитель (MSG_VIDEO_STOP)
         env = clean_env()
         opener = shutil.which("xdg-open", path=env["PATH"])
         if not opener:
@@ -1105,11 +1129,71 @@ class MediaController:
             self.proc = None
             self.playing_path = None
             self.playing_id = None
+        self.paused = False
         if proc is not None:
             self._terminate(proc)
+        elif path is not None and sys.platform == "win32":
+            self._close_windows_player(path)
         if path is not None:
             self._remove(path)
             self._report(fid, "done", True)
+
+    # --- пауза / продовження ---
+    def toggle_pause(self):
+        with self.lock:
+            proc = self.proc
+            path = self.playing_path
+        if path is None:
+            return
+        if sys.platform == "win32":
+            # системна медіаклавіша Play/Pause — працює з будь-яким плеєром, зокрема UWP
+            user32 = ctypes.windll.user32
+            user32.keybd_event(0xB3, 0, 0, 0)       # VK_MEDIA_PLAY_PAUSE, натискання
+            user32.keybd_event(0xB3, 0, 2, 0)       # відпускання
+            self.paused = not self.paused
+            return
+        import signal
+        try:
+            if proc is not None:
+                os.kill(proc.pid, signal.SIGCONT if self.paused else signal.SIGSTOP)
+                self.paused = not self.paused
+                return
+        except OSError:
+            return
+        env = clean_env()
+        ctl = shutil.which("playerctl", path=env["PATH"])
+        if ctl:
+            try:
+                subprocess.Popen([ctl, "play-pause"], env=env,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self.paused = not self.paused
+            except OSError:
+                pass
+
+    @staticmethod
+    def _close_windows_player(path):
+        """Закриває вікна, у заголовку яких є ім'я відтворюваного файлу (штатні
+        плеєри Windows показують його). Інші вікна учня не чіпаємо."""
+        base = os.path.basename(path).lower()
+        stem = os.path.splitext(base)[0]
+        user32 = ctypes.windll.user32
+        titles = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def enum_proc(hwnd, _lparam):
+            if user32.IsWindowVisible(hwnd):
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n:
+                    buf = ctypes.create_unicode_buffer(n + 1)
+                    user32.GetWindowTextW(hwnd, buf, n + 1)
+                    title = buf.value.lower()
+                    if stem and (base in title or stem in title):
+                        titles.append(hwnd)
+            return True
+
+        user32.EnumWindows(enum_proc, 0)
+        for hwnd in titles:
+            user32.PostMessageW(hwnd, 0x0010, 0, 0)   # WM_CLOSE
 
     @staticmethod
     def _terminate(proc):
@@ -1123,6 +1207,8 @@ class MediaController:
             pass
 
     def _remove(self, path):
+        if sys.platform == "win32":
+            return   # Windows: файл лишається в теці учня; штатний плеєр (UWP) відкриває його асинхронно
         for attempt in range(5):
             try:
                 os.remove(path)
@@ -1388,6 +1474,10 @@ def receiver(sock, viewer, dead, stop_event, files, send, power, media=None):
                 else:
                     files.end(data)
                 continue
+            if kind == MSG_VIDEO_PAUSE:
+                if media is not None:
+                    media.toggle_pause()
+                continue
             if kind == MSG_VIDEO_STOP:
                 if media is not None:
                     media.stop()
@@ -1443,8 +1533,11 @@ def stream(ip, port, token, name, interval, viewer, stop_event, file_cfg, power)
             else:
                 print(f"\n=== {text} ===\n", flush=True)
 
-        video_dir = file_cfg.get("video_dir") or os.path.join(
-            tempfile.gettempdir(), "classroom_video")
+        if sys.platform == "win32":
+            video_dir = file_cfg["save_dir"]     # та сама тека, що й для "Надіслати файли"
+        else:
+            video_dir = file_cfg.get("video_dir") or os.path.join(
+                tempfile.gettempdir(), "classroom_video")
         media = MediaController(
             notify, send, video_dir, notify_auto=notify_auto,
             dismiss=viewer.request_close_message if viewer is not None else None)
