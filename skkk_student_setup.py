@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """SKKK — меню налаштування учнівського комп'ютера.
 
-Графічне меню з п'ятьма діями для комп'ютера учня:
+Графічне меню з шістьма діями для комп'ютера учня:
   * «Налаштування системи» — перевіряє/встановлює потрібні компоненти
     (tkinter, Pillow, ImageTk, mss), перевіряє локальну мережу, вмикає
     синхронізацію часу, відкриває вхідний UDP-порт у фаєрволі, дозволяє
@@ -12,6 +12,8 @@
   * «Видалити з Автозавантаження» — прибирає обидва з автозавантаження;
   * «Запустити систему» — запускає netguard з правами адміністратора та
     агента учня, якщо вони ще не працюють;
+  * «Зупинити систему» — зупиняє netguard і агента учня (комп'ютер при
+    цьому не вимикається);
   * «Перевірити параметри» — показує стан токена, налаштувань, мережі,
     синхронізації часу, фаєрвола, автозавантаження та процесів.
 
@@ -148,8 +150,8 @@ class SetupApp:
     def build(self):
         self.root.title("SKKK — налаштування учнівського комп'ютера")
         self.root.configure(bg=BG)
-        self.root.geometry("780x620")
-        self.root.minsize(660, 520)
+        self.root.geometry("780x680")
+        self.root.minsize(660, 560)
 
         header = tk.Frame(self.root, bg=BG)
         header.pack(fill="x", padx=16, pady=(14, 6))
@@ -174,6 +176,9 @@ class SetupApp:
         self._menu_button(menu, "Запустити систему",
                           "netguard з правами адміністратора та агент учня",
                           self.on_launch)
+        self._menu_button(menu, "Зупинити систему",
+                          "зупинити netguard і агента учня (комп'ютер не вимикається)",
+                          self.on_stop)
         self._menu_button(menu, "Перевірити параметри",
                           "стан токена, налаштувань, файрвола, автозавантаження",
                           self.on_check)
@@ -285,6 +290,9 @@ class SetupApp:
 
     def on_launch(self):
         self._start_task(self.task_launch, "Запустити систему")
+
+    def on_stop(self):
+        self._start_task(self.task_stop, "Зупинити систему")
 
     def on_check(self):
         self._start_task(self.task_check, "Перевірити параметри")
@@ -1180,6 +1188,95 @@ class SetupApp:
             return result is not None and result.returncode == 0
         self.log("Запуск netguard не підтримується на цій системі.")
         return False
+
+    # ---------- зупинка процесів ----------
+    def _process_pattern(self, name):
+        """Шаблон для pgrep/pkill. Для зібраного застосунку — ім'я файла
+        (наприклад, ``netguard``), для запуску з коду — ``name.py``. Перший
+        символ загортаємо у дужки (``[n]etguard``): так регекс збігається з
+        реальним процесом, але не з командним рядком оболонки, що виконує
+        pkill, тож вона не «вбиває сама себе»."""
+        base = name if common.is_frozen() else name + ".py"
+        return "[" + base[0] + "]" + base[1:]
+
+    def _stop_process(self, name, root=False):
+        """Зупиняє всі процеси із заданим ім'ям. Повертає True, якщо команду
+        зупинки виконано (станом процесу слід перевірити окремо через
+        ``_is_running``). ``root=True`` — для привілейованого netguard."""
+        system = platform.system()
+        if system == "Windows":
+            return self._stop_process_windows(name, root)
+        if system == "Linux":
+            return self._stop_process_linux(name, root)
+        self.log("Зупинка не підтримується на цій системі.")
+        return False
+
+    def _stop_process_linux(self, name, root=False):
+        pattern = shlex.quote(self._process_pattern(name))
+        script = (f"pkill -f {pattern} 2>/dev/null; sleep 1; "
+                  f"pkill -9 -f {pattern} 2>/dev/null; true")
+        if root:
+            result = self.run_privileged(
+                script, f"Щоб зупинити {name} (права root), потрібен пароль.")
+        else:
+            result = self.run_plain(["sh", "-c", script])
+        return result is not None and result.returncode == 0
+
+    def _stop_process_windows(self, name, root=False):
+        if common.is_frozen():
+            argv = ["taskkill", "/F", "/IM", name + ".exe", "/T"]
+        else:
+            needle = _ps_quote("*" + name + ".py*")
+            ps = ("Get-CimInstance Win32_Process | Where-Object { "
+                  f"$_.CommandLine -like {needle} }} | ForEach-Object {{ "
+                  "Stop-Process -Id $_.ProcessId -Force "
+                  "-ErrorAction SilentlyContinue }")
+            argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                    "-EncodedCommand", _ps_encoded(ps)]
+        if root:
+            script = subprocess.list2cmdline(argv)
+            result = self.run_privileged(
+                script, f"Щоб зупинити {name} (права адміністратора), потрібен UAC.")
+        else:
+            result = self.run_plain(argv)
+        return result is not None and result.returncode == 0
+
+    def _stop_component(self, name, title, root):
+        """Зупиняє один компонент. Повертає True/False, якщо він працював і
+        був зупинений/не зупинений, або None — якщо не запущений."""
+        if not common.program_exists(name) and not self._is_running(name):
+            self.log_warn(f"Не знайдено застосунок {name} поряд із цією програмою.")
+            return None
+        if not self._is_running(name):
+            self.log(f"{title} не запущено.")
+            return None
+        stopped = self._stop_process(name, root=root)
+        if stopped and not self._is_running(name):
+            self.log_ok(f"{title} зупинено.")
+            return True
+        # Якщо не вдалося з правами користувача — пробуємо привілейовано.
+        if not root and (not stopped or self._is_running(name)):
+            stopped = self._stop_process(name, root=True)
+            if stopped and not self._is_running(name):
+                self.log_ok(f"{title} зупинено (з правами адміністратора).")
+                return True
+        self.log_fail(f"Не вдалося зупинити {title}.")
+        return False
+
+    def task_stop(self):
+        results = []
+        result = self._stop_component(NETGUARD_NAME, "netguard", root=True)
+        if result is not None:
+            results.append(result)
+        result = self._stop_component(AGENT_NAME, "Агент учня", root=False)
+        if result is not None:
+            results.append(result)
+
+        if not results:
+            return True, "Нічого зупиняти — обидва компоненти не запущені."
+        if all(results):
+            return True, "Систему зупинено (netguard і агент учня)."
+        return False, "Не вдалося зупинити всі компоненти — див. журнал."
 
     # ---------- завдання: перевірка параметрів ----------
     def task_check(self):
